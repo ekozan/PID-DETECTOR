@@ -115,6 +115,10 @@ class Config:
     highlight_thickness: int = 10
     highlight_alpha: float = 0.45
 
+    # --- Marquage des ruptures de ligne ---
+    break_dot_color: Tuple[int, int, int] = (255, 0, 0)  # BGR bleu
+    break_dot_radius: int = 5
+
     # --- Sorties ---
     draw_thickness: int = 3
     export_svg: bool = True
@@ -765,11 +769,11 @@ def colorize_lines(
         color = _color_for(seg.line_id)
         cv2.line(canvas, seg.p1, seg.p2, color, cfg.draw_thickness, cv2.LINE_AA)
 
-    # marque les ruptures (les segments reconnectés gardent la même couleur)
+    # marque chaque rupture par un POINT BLEU (les segments reconnectés gardent
+    # la même couleur de ligne : la rupture ne coupe pas la ligne logiquement)
     for br in breaks:
-        x, y, w, h = br.bbox
-        cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 0, 255), 1)
-        cv2.circle(canvas, (br.cx, br.cy), 3, (0, 0, 255), -1)
+        cv2.circle(canvas, (br.cx, br.cy), cfg.break_dot_radius,
+                   cfg.break_dot_color, -1, cv2.LINE_AA)
 
     # étiquette l'id de ligne près d'un segment représentatif
     seen = set()
