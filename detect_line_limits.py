@@ -61,6 +61,9 @@ class LimitConfig:
     on_pipe_tol: float = 1.5      # tolérance "extrémité sur la conduite" (pt)
     connector_reach: float = 15.0 # distance max connecteur->triangle (pt)
     ink_max: float = 0.16         # densité d'encre max (exclut flèches pleines)
+    # Calques considérés comme "conduite" pour le placement de la jonction
+    # (exclut les leaders d'annotation/instrument qui ne sont PAS des tuyaux).
+    pipe_layers: Tuple[str, ...] = ("UTI", "0")
     # --- exclusion Pente / Calo (template d'empreinte) ---
     # Le bloc « Limite de ligne » pur n'a que ses ~6 segments nets. Pente et Calo
     # portent en plus des micro-traits (glyphes de la valeur de pente / du repère
@@ -68,6 +71,7 @@ class LimitConfig:
     micro_len_max: float = 2.2    # longueur max d'un "micro-trait" de glyphe (pt)
     micro_radius: float = 20.0    # rayon de recherche autour du triangle (pt)
     filter_micro: bool = False    # exclusion Pente/Calo par micro-traits (trop large -> off)
+    filter_changement: bool = False  # exclusion Changement (nend>=2) : supprime aussi les LB sur vanne -> off
     # --- raffinement du point (post-traitement) ---
     connector_short_max: float = 12.0  # longueur max d'un connecteur du symbole (pt)
     refine_max_shift: float = 14.0     # déplacement max autorisé du point raffiné (pt)
@@ -75,12 +79,17 @@ class LimitConfig:
     dot_radius: int = 9
 
 
-def _extract_segments(page) -> Tuple[List[Tuple], List[Tuple]]:
-    """Retourne (segments_non_remplis, conduites_longues)."""
+def _extract_segments(page, cfg: "LimitConfig") -> Tuple[List[Tuple], List[Tuple]]:
+    """Retourne (segments_non_remplis, conduites_longues).
+
+    Les *conduites* sont restreintes aux calques de tuyauterie (cfg.pipe_layers)
+    pour ne pas placer la jonction sur un leader d'annotation/instrument.
+    """
     nf: List[Tuple] = []
     longs: List[Tuple] = []
     for d in page.get_drawings():
         filled = d.get("fill") is not None and d.get("type") in ("f", "fs")
+        is_pipe_layer = d.get("layer") in cfg.pipe_layers
         for it in d["items"]:
             if it[0] != "l":
                 continue
@@ -88,7 +97,7 @@ def _extract_segments(page) -> Tuple[List[Tuple], List[Tuple]]:
             L = math.hypot(s[2] - s[0], s[3] - s[1])
             if not filled:
                 nf.append((s, L))
-            if L >= 18.0:
+            if L >= 18.0 and is_pipe_layer:
                 longs.append(s)
     return nf, longs
 
@@ -141,7 +150,7 @@ def detect_line_limits(page, cfg: LimitConfig = LimitConfig()) -> List[dict]:
     """
     rot = page.rotation
     page.set_rotation(0)
-    nf, longs = _extract_segments(page)
+    nf, longs = _extract_segments(page, cfg)
     tris = _hollow_triangles(nf, cfg)
 
     # micro-traits (glyphes de pente/calo) : centres des très courts segments
@@ -198,7 +207,7 @@ def detect_line_limits(page, cfg: LimitConfig = LimitConfig()) -> List[dict]:
             1 for L in longs for ex, ey in ((L[0], L[1]), (L[2], L[3]))
             if math.hypot(ex - junction[0], ey - junction[1]) < 3.0
         )
-        if nend >= 2:
+        if cfg.filter_changement and nend >= 2:
             continue
         # (Optionnel) exclusion « Pente / Calo » par micro-traits de glyphe près
         # du triangle. Désactivé par défaut : trop large (se déclenche aussi sur
