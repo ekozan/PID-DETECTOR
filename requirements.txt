@@ -10,3 +10,6 @@ easyocr>=1.7.0
 
 # Lecture vectorielle des P&ID PDF (detect_line_limits.py)
 pymupdf>=1.23.0
+
+# Surlignage : dépendance Excel
+openpyxl>=3.1.0
