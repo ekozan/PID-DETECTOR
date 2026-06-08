@@ -221,3 +221,6 @@ __marimo__/
 out/
 *.png
 !docs/*.png
+out_*/
+*.jpg
+*.jpeg

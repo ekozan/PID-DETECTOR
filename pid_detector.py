@@ -100,6 +100,20 @@ class Config:
     arrow_min_area: int = 30
     arrow_max_area: int = 2500
 
+    # --- Composants "traversants" (vannes, nuages calorifuge, bulles d'instrument) ---
+    # Ils coupent visuellement la ligne mais ne la coupent pas logiquement :
+    # traités comme des points de jonction qui déclenchent une reconnexion.
+    detect_fittings: bool = True
+    fitting_min_area: int = 30
+    fitting_max_area: int = 6000
+    fitting_ar_min: float = 0.3       # ratio largeur/hauteur "compact"
+    fitting_ar_max: float = 3.5
+
+    # --- Surlignage d'une ligne (mode highlight) ---
+    highlight_color: Tuple[int, int, int] = (0, 255, 255)  # BGR jaune
+    highlight_thickness: int = 10
+    highlight_alpha: float = 0.45
+
     # --- Sorties ---
     draw_thickness: int = 3
     export_svg: bool = True
@@ -112,6 +126,31 @@ class Config:
         r"\b316L?\b|\b304L?\b|\bINOX\b|\bCS\b|\bA106\b",  # matériaux
         r"\bAZOTE\b|\bAIR\b|\bN2\b|\bO2\b|\bEAU\b|\bVAPEUR\b|\bGAZ\b",  # produits
     )
+
+
+# Presets de seuils. "real_plan" est calibré sur des P&ID scannés réels où la
+# conduite principale est quasi-horizontale et traverse vannes / nuages / ruptures.
+PRESETS: Dict[str, dict] = {
+    "default": {},
+    "real_plan": dict(
+        angle_tol_deg=6.0,
+        merge_perp_tol=8,
+        merge_gap_tol=160,
+        node_snap_tol=40,
+        reconnect_max_dist=250,
+        reconnect_align_tol=18,
+        draw_thickness=4,
+    ),
+}
+
+
+def apply_preset(cfg: "Config", name: str) -> "Config":
+    """Applique un preset de seuils sur une configuration existante."""
+    if name not in PRESETS:
+        raise ValueError(f"Preset inconnu : {name} (dispo : {', '.join(PRESETS)})")
+    for key, val in PRESETS[name].items():
+        setattr(cfg, key, val)
+    return cfg
 
 
 # ============================================================================
@@ -369,7 +408,43 @@ def detect_break_symbols(img: np.ndarray, cfg: Config) -> List[BreakSymbol]:
 
 
 # ============================================================================
-#  6. RECONNEXION DES LIGNES A TRAVERS LES RUPTURES
+#  5bis. COMPOSANTS TRAVERSANTS (vannes, nuages, bulles d'instrument)
+# ============================================================================
+def detect_fittings(img: np.ndarray, cfg: Config) -> List[Tuple[int, int]]:
+    """
+    Détecte les symboles "traversants" qui coupent visuellement la ligne sans la
+    couper logiquement : vannes (noeud papillon), nuages de calorifuge/tracé,
+    bulles d'instrument. Renvoie leurs centroïdes.
+
+    Ils sont fournis comme points de jonction à `reconnect_lines`, qui ne relie
+    que des segments réellement colinéaires de part et d'autre : un blob isolé
+    (texte, cartouche) ne crée donc pas de faux pont.
+    """
+    if not cfg.detect_fittings:
+        return []
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    points: List[Tuple[int, int]] = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if not (cfg.fitting_min_area <= area <= cfg.fitting_max_area):
+            continue
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w == 0 or h == 0:
+            continue
+        ar = w / float(h)
+        if not (cfg.fitting_ar_min <= ar <= cfg.fitting_ar_max):
+            continue  # écarte les contours très allongés (= morceaux de ligne)
+        M = cv2.moments(cnt)
+        if M["m00"] <= 0:
+            continue
+        points.append((int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])))
+    return points
+
+
+# ============================================================================
+#  6. RECONNEXION DES LIGNES A TRAVERS LES RUPTURES / COMPOSANTS
 # ============================================================================
 def _endpoint_near(seg: Segment, pt: Tuple[int, int]) -> Tuple[int, int]:
     """Retourne l'extrémité de `seg` la plus proche de `pt`."""
@@ -379,18 +454,19 @@ def _endpoint_near(seg: Segment, pt: Tuple[int, int]) -> Tuple[int, int]:
 
 
 def reconnect_lines(
-    segments: List[Segment], breaks: Sequence[BreakSymbol], cfg: Config
-) -> List[Tuple[int, int]]:
+    segments: List[Segment],
+    junctions: Sequence[Tuple[int, int]],
+    cfg: Config,
+) -> List[Tuple[int, int, Tuple[int, int]]]:
     """
-    Pour chaque symbole de rupture, cherche deux segments alignés de part et
-    d'autre et renvoie la liste des paires (i, j) d'indices de segments à
-    reconnecter (= arêtes virtuelles ajoutées au graphe).
+    Pour chaque point de jonction (rupture ISA OU composant traversant), cherche
+    deux segments alignés de part et d'autre et renvoie la liste des ponts
+    (i, j, centre) à reconnecter (= arêtes virtuelles ajoutées au graphe).
 
     Conditions : alignement transversal, distance < seuil, angle similaire.
     """
-    bridges: List[Tuple[int, int]] = []
-    for br in breaks:
-        center = (br.cx, br.cy)
+    bridges: List[Tuple[int, int, Tuple[int, int]]] = []
+    for center in junctions:
         # candidats : segments dont une extrémité passe près du symbole
         candidates: List[Tuple[int, float, Tuple[int, int]]] = []
         for idx, seg in enumerate(segments):
@@ -412,7 +488,7 @@ def reconnect_lines(
                     continue
                 sa, sb = segments[ia], segments[ib]
                 if _are_collinear_across(sa, sb, ea, eb, center, cfg):
-                    bridges.append((ia, ib))
+                    bridges.append((ia, ib, center))
                     used.add(ia)
                     used.add(ib)
                     break
@@ -453,7 +529,9 @@ def _are_collinear_across(
 #  7. CONSTRUCTION DU GRAPHE (networkx) -> lignes = composantes connexes
 # ============================================================================
 def build_graph(
-    segments: List[Segment], bridges: Sequence[Tuple[int, int]], cfg: Config
+    segments: List[Segment],
+    bridges: Sequence[Tuple[int, int, Tuple[int, int]]],
+    cfg: Config,
 ) -> Tuple[nx.Graph, Dict[int, List[int]]]:
     """
     Construit un graphe :
@@ -486,8 +564,8 @@ def build_graph(
         if n1 != n2:
             G.add_edge(n1, n2, seg_index=idx)
 
-    # ponts de reconnexion (rupture) : relient les noeuds proches du symbole
-    for ia, ib in bridges:
+    # ponts de reconnexion (rupture/composant) : relient les noeuds proches du symbole
+    for ia, ib, _center in bridges:
         a_n1, a_n2 = seg_nodes[ia]
         b_n1, b_n2 = seg_nodes[ib]
         # relie les extrémités les plus proches entre les deux segments
@@ -691,6 +769,64 @@ def colorize_lines(
 
 
 # ============================================================================
+#  BONUS : surlignage d'une ligne choisie (façon highlight jaune du plan)
+# ============================================================================
+def line_summaries(
+    segments: List[Segment], labels: Dict[int, List[str]]
+) -> List[dict]:
+    """Résumé par ligne : id, longueur cumulée, étendue x, label. Trié par longueur."""
+    agg: Dict[int, dict] = {}
+    for s in segments:
+        if s.line_id < 0:
+            continue
+        a = agg.setdefault(
+            s.line_id, {"id": s.line_id, "length": 0.0, "xmin": 1e9, "xmax": -1e9}
+        )
+        a["length"] += s.length
+        a["xmin"] = min(a["xmin"], s.x1, s.x2)
+        a["xmax"] = max(a["xmax"], s.x1, s.x2)
+    out = []
+    for lid, a in agg.items():
+        a["length"] = int(a["length"])
+        a["xmin"], a["xmax"] = int(a["xmin"]), int(a["xmax"])
+        a["label"] = " ".join(dict.fromkeys(labels.get(lid, [])))
+        out.append(a)
+    out.sort(key=lambda d: -d["length"])
+    return out
+
+
+def select_line(
+    summaries: List[dict], line_id: Optional[int], label: Optional[str]
+) -> Optional[int]:
+    """Choisit la ligne à surligner : par id explicite, par label, sinon la plus longue."""
+    if line_id is not None:
+        return line_id
+    if label:
+        lab = label.lower()
+        for s in summaries:
+            if lab in s["label"].lower():
+                return s["id"]
+        return None
+    return summaries[0]["id"] if summaries else None
+
+
+def highlight_line(
+    img: np.ndarray, segments: List[Segment], line_id: int, cfg: Config
+) -> np.ndarray:
+    """Surligne UNE ligne en jaune épais semi-transparent, comme sur un plan annoté."""
+    overlay = img.copy()
+    for s in segments:
+        if s.line_id == line_id:
+            cv2.line(
+                overlay, s.p1, s.p2, cfg.highlight_color,
+                cfg.highlight_thickness, cv2.LINE_AA,
+            )
+    return cv2.addWeighted(
+        overlay, cfg.highlight_alpha, img, 1.0 - cfg.highlight_alpha, 0
+    )
+
+
+# ============================================================================
 #  11. SORTIES (JSON, image, SVG)
 # ============================================================================
 def _build_line_records(
@@ -698,11 +834,20 @@ def _build_line_records(
     line_map: Dict[int, List[int]],
     labels: Dict[int, List[str]],
     breaks: Sequence[BreakSymbol],
-    bridges: Sequence[Tuple[int, int]],
+    bridges: Sequence[Tuple[int, int, Tuple[int, int]]],
+    cfg: Config,
 ) -> List[dict]:
-    # une ligne a une rupture si l'un de ses segments est impliqué dans un pont
+    # une ligne a une rupture ISA si un pont, centré sur un *symbole de rupture*
+    # (et non un simple composant traversant), implique l'un de ses segments.
+    break_centers = [(b.cx, b.cy) for b in breaks]
     lines_with_break = set()
-    for ia, ib in bridges:
+    for ia, ib, center in bridges:
+        near_break = any(
+            math.hypot(center[0] - bx, center[1] - by) <= cfg.node_snap_tol
+            for bx, by in break_centers
+        )
+        if not near_break:
+            continue
         for idx in (ia, ib):
             lid = segments[idx].line_id
             if lid >= 0:
@@ -783,7 +928,14 @@ def _save_debug(outdir: str, name: str, img: np.ndarray) -> None:
 # ============================================================================
 #  ORCHESTRATION
 # ============================================================================
-def process(image_path: str, outdir: str, cfg: Config) -> List[dict]:
+def process(
+    image_path: str,
+    outdir: str,
+    cfg: Config,
+    highlight: Optional[int] = None,
+    highlight_label: Optional[str] = None,
+    list_only: bool = False,
+) -> List[dict]:
     """Exécute l'ensemble du pipeline et renvoie les enregistrements de lignes."""
     print(f"[1] Chargement       : {image_path}")
     img = load_image(image_path)
@@ -805,8 +957,14 @@ def process(image_path: str, outdir: str, cfg: Config) -> List[dict]:
     breaks = detect_break_symbols(img, cfg)
     print(f"    -> {len(breaks)} rupture(s)")
 
-    print("[6] Reconnexion à travers les ruptures")
-    bridges = reconnect_lines(segments, breaks, cfg)
+    print("[5bis] Détection des composants traversants (vannes/nuages/instruments)")
+    fittings = detect_fittings(img, cfg)
+    print(f"    -> {len(fittings)} composant(s) traversant(s)")
+
+    print("[6] Reconnexion à travers ruptures + composants")
+    # ruptures ISA ET composants traversants servent de points de jonction
+    junctions = [(b.cx, b.cy) for b in breaks] + fittings
+    bridges = reconnect_lines(segments, junctions, cfg)
     print(f"    -> {len(bridges)} pont(s) de reconnexion")
 
     print("[7] Construction du graphe (composantes = lignes)")
@@ -824,27 +982,58 @@ def process(image_path: str, outdir: str, cfg: Config) -> List[dict]:
         arrows = detect_arrows(img, cfg)
         print(f"[bonus] {len(arrows)} flèche(s) détectée(s)")
 
+    # résumé des lignes (utile pour choisir laquelle surligner)
+    summaries = line_summaries(segments, labels)
+    if list_only or cfg.debug:
+        print("    Lignes détectées (id | long.px | x[min..max] | label) :")
+        for s in summaries[:20]:
+            print(f"      L{s['id']:<3} | {s['length']:>5} | "
+                  f"{s['xmin']:>4}..{s['xmax']:<4} | {s['label']}")
+    if list_only:
+        return _build_line_records(segments, line_map, labels, breaks, bridges, cfg)
+
     print("[10] Colorisation")
     annotated = colorize_lines(img, segments, breaks, cfg)
 
+    # mode surlignage : une ligne en jaune épais sur le plan d'origine
+    if highlight is not None or highlight_label is not None:
+        chosen = select_line(summaries, highlight, highlight_label)
+        if chosen is None:
+            print(f"    [highlight] aucune ligne ne correspond à '{highlight_label}'")
+        else:
+            hl = highlight_line(img, segments, chosen, cfg)
+            os.makedirs(outdir, exist_ok=True)
+            hpath = os.path.join(outdir, "highlighted.png")
+            cv2.imwrite(hpath, hl)
+            print(f"    [highlight] ligne L{chosen} surlignée -> {hpath}")
+
     print("[11] Export")
-    records = _build_line_records(segments, line_map, labels, breaks, bridges)
+    records = _build_line_records(segments, line_map, labels, breaks, bridges, cfg)
     export_results(outdir, annotated, records, segments, cfg, img.shape)
     return records
 
 
 def build_config_from_args(args: argparse.Namespace) -> Config:
     cfg = Config()
+    # 1) preset d'abord (valeurs de base), puis surcharges CLI
+    if args.preset:
+        apply_preset(cfg, args.preset)
     cfg.debug = args.debug
     cfg.ocr_enabled = not args.no_ocr
     cfg.ocr_engine = args.ocr_engine
     cfg.export_svg = not args.no_svg
-    if args.canny_low is not None:
-        cfg.canny_low = args.canny_low
-    if args.canny_high is not None:
-        cfg.canny_high = args.canny_high
-    if args.reconnect_dist is not None:
-        cfg.reconnect_max_dist = args.reconnect_dist
+    cfg.detect_fittings = not args.no_fittings
+    for attr, val in (
+        ("canny_low", args.canny_low),
+        ("canny_high", args.canny_high),
+        ("reconnect_max_dist", args.reconnect_dist),
+        ("merge_gap_tol", args.merge_gap),
+        ("node_snap_tol", args.node_snap),
+        ("reconnect_align_tol", args.reconnect_align),
+        ("angle_tol_deg", args.angle_tol),
+    ):
+        if val is not None:
+            setattr(cfg, attr, val)
     return cfg
 
 
@@ -854,6 +1043,8 @@ def main() -> int:
     )
     parser.add_argument("--input", "-i", required=True, help="Image P&ID en entrée")
     parser.add_argument("--outdir", "-o", default="out", help="Dossier de sortie")
+    parser.add_argument("--preset", choices=list(PRESETS), default=None,
+                        help="Preset de seuils ('real_plan' pour plans scannés réels)")
     parser.add_argument("--debug", action="store_true", help="Sauve les étapes intermédiaires")
     parser.add_argument("--no-ocr", action="store_true", help="Désactive l'OCR")
     parser.add_argument(
@@ -861,15 +1052,38 @@ def main() -> int:
         help="Moteur OCR",
     )
     parser.add_argument("--no-svg", action="store_true", help="Désactive l'export SVG")
+    parser.add_argument("--no-fittings", action="store_true",
+                        help="Ne pas traiter vannes/nuages comme traversants")
+    # --- surlignage / inspection ---
+    parser.add_argument("--highlight", type=int, default=None,
+                        help="Surligne la ligne d'id donné (jaune épais)")
+    parser.add_argument("--highlight-label", default=None,
+                        help="Surligne la ligne dont le label contient ce texte (ex: AZOTE)")
+    parser.add_argument("--list-lines", action="store_true",
+                        help="Liste les lignes détectées (id, longueur, étendue, label) et sort")
+    # --- seuils réglables ---
     parser.add_argument("--canny-low", type=int, default=None)
     parser.add_argument("--canny-high", type=int, default=None)
     parser.add_argument("--reconnect-dist", type=int, default=None,
-                        help="Distance max de reconnexion à travers une rupture (px)")
+                        help="Distance max de reconnexion à travers une jonction (px)")
+    parser.add_argument("--merge-gap", type=int, default=None,
+                        help="Trou max le long de l'axe pour fusionner deux segments (px)")
+    parser.add_argument("--node-snap", type=int, default=None,
+                        help="Rayon de fusion des extrémités en noeuds/intersections (px)")
+    parser.add_argument("--reconnect-align", type=int, default=None,
+                        help="Tolérance d'alignement transversal à la reconnexion (px)")
+    parser.add_argument("--angle-tol", type=float, default=None,
+                        help="Tolérance d'orientation horizontale/verticale (deg)")
     args = parser.parse_args()
 
     cfg = build_config_from_args(args)
     try:
-        process(args.input, args.outdir, cfg)
+        process(
+            args.input, args.outdir, cfg,
+            highlight=args.highlight,
+            highlight_label=args.highlight_label,
+            list_only=args.list_lines,
+        )
     except (FileNotFoundError, ValueError) as exc:
         print(f"[ERREUR] {exc}")
         return 1
