@@ -160,6 +160,15 @@ def detect_line_limits(page, cfg: LimitConfig = LimitConfig()) -> List[dict]:
                             best, junction = dtri, (ex, ey)
         if junction is None:
             junction = min((_foot(cx, cy, L) for L in near), key=lambda r: r[1])[0]
+        # Exclusion « Changement de classe/calo » : à leur jonction, DEUX
+        # extrémités de conduite se rejoignent (la ligne continue), alors qu'un
+        # vrai « Limite de ligne » n'en a qu'une.
+        nend = sum(
+            1 for L in longs for ex, ey in ((L[0], L[1]), (L[2], L[3]))
+            if math.hypot(ex - junction[0], ey - junction[1]) < 3.0
+        )
+        if nend >= 2:
+            continue
         results.append({"triangle": (cx, cy), "point": junction})
 
     page.set_rotation(rot)
