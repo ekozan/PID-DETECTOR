@@ -7,3 +7,6 @@ networkx>=3.0
 # pytesseract is supported as a fallback (requires the Tesseract binary installed on the system).
 easyocr>=1.7.0
 # pytesseract>=0.3.10
+
+# Lecture vectorielle des P&ID PDF (detect_line_limits.py)
+pymupdf>=1.23.0
