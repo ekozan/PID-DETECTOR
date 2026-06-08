@@ -8,28 +8,25 @@ Détection du symbole **« Limite de ligne / Pipe end symbol »** sur un P&ID
 **vectoriel** (PDF), et placement d'un **point bleu** à la jonction du symbole
 sur la conduite.
 
-Approche (extraction vectorielle PyMuPDF, pas de raster) :
-  1. Extraire tous les segments de trait ; séparer les chemins **remplis**
-     (flèches pleines de sens/vanne) des chemins **non remplis**.
-  2. Le symbole « Limite de ligne » contient un **petit triangle creux ~7 pt**
-     (3 segments non remplis formant un triangle fermé) relié par un connecteur
-     coudé à une **ligne perpendiculaire « limite »** qui touche la conduite.
-  3. Filtres :
-       - triangle creux isolé (taille ~7 pt) ;
-       - **exclusion des soupapes** : deux triangles creux partageant un sommet
-         (nœud papillon) → PSV/relief ;
-       - exclusion par densité d'encre (flèches pleines résiduelles).
-  4. Point = extrémité du connecteur du symbole **qui touche la conduite**
-     (la jonction réellement dessinée).
+Méthode (robuste, par calque CAO)
+---------------------------------
+Le symbole « Limite de ligne » est dessiné sur un **calque dédié** (ici ``"14"``).
+On le détecte donc **directement par calque** plutôt que par reconnaissance
+géométrique : sur un P&ID, les line breaks, flèches de sens, pente, calo et
+changement de classe sont tous de petits triangles creux quasi identiques, et
+aucune heuristique locale ne les sépare de façon fiable. Le calque, lui, est
+non ambigu.
 
-Limites connues : certains symboles voisins (« Changement de classe / calo »,
-callouts de numéro de ligne) contiennent un triangle similaire et peuvent
-produire des faux positifs ; le discriminateur fin reste à affiner.
+Étapes :
+  1. Récupérer tous les traits du calque ``symbol_layer`` → regrouper en symboles.
+  2. Pour chaque symbole, placer le point à l'extrémité de son connecteur qui
+     **touche une conduite** (calques ``pipe_layers``), sinon à la projection du
+     centre du symbole sur la conduite la plus proche.
 
 Dépendances : pymupdf (fitz), opencv-python, numpy.
 
 Usage :
-    python detect_line_limits.py --pdf plan.pdf --outdir out [--page 0]
+    python detect_line_limits.py --pdf plan.pdf --outdir out [--page 0] [--symbol-layer 14]
 """
 from __future__ import annotations
 
@@ -37,9 +34,8 @@ import argparse
 import json
 import math
 import os
-from collections import defaultdict, Counter
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 
 import cv2
 import numpy as np
@@ -52,86 +48,26 @@ except ImportError as exc:  # pragma: no cover
 
 @dataclass
 class LimitConfig:
-    tri_min: float = 4.0          # longueur min d'un côté de triangle (pt)
-    tri_max: float = 10.0         # longueur max (pt)
-    pipe_min: float = 18.0        # longueur min d'une "conduite" (pt)
-    snap: float = 1.0             # tolérance de fusion des extrémités (pt)
-    dedup: float = 5.0            # distance min entre 2 détections (pt)
-    pipe_search: float = 35.0     # rayon de recherche d'une conduite proche (pt)
-    on_pipe_tol: float = 1.5      # tolérance "extrémité sur la conduite" (pt)
-    connector_reach: float = 15.0 # distance max connecteur->triangle (pt)
-    ink_max: float = 0.16         # densité d'encre max (exclut flèches pleines)
-    # Calques considérés comme "conduite" pour le placement de la jonction
-    # (exclut les leaders d'annotation/instrument qui ne sont PAS des tuyaux).
+    # Calque CAO des symboles « Limite de ligne » (détection fiable par calque).
+    symbol_layer: str = "14"
+    cluster_tol: float = 18.0     # rayon de regroupement des traits d'un symbole (pt)
+    # Calques "conduite" pour poser le point sur le tuyau (exclut les leaders
+    # d'annotation/instrument qui ne sont PAS des conduites).
     pipe_layers: Tuple[str, ...] = ("UTI", "0")
-    # --- exclusion Pente / Calo (template d'empreinte) ---
-    # Le bloc « Limite de ligne » pur n'a que ses ~6 segments nets. Pente et Calo
-    # portent en plus des micro-traits (glyphes de la valeur de pente / du repère
-    # calo). Présence de tels micro-segments près du triangle => on exclut.
-    micro_len_max: float = 2.2    # longueur max d'un "micro-trait" de glyphe (pt)
-    micro_radius: float = 20.0    # rayon de recherche autour du triangle (pt)
-    filter_micro: bool = False    # exclusion Pente/Calo par micro-traits (trop large -> off)
-    filter_changement: bool = False  # exclusion Changement (nend>=2) : supprime aussi les LB sur vanne -> off
-    # --- raffinement du point (post-traitement) ---
-    connector_short_max: float = 12.0  # longueur max d'un connecteur du symbole (pt)
-    refine_max_shift: float = 14.0     # déplacement max autorisé du point raffiné (pt)
+    pipe_search: float = 40.0     # rayon de recherche d'une conduite proche (pt)
+    on_pipe_tol: float = 2.0      # tolérance "extrémité du symbole sur la conduite" (pt)
     render_zoom: float = 2.5      # zoom du rendu annoté
     dot_radius: int = 9
 
 
-def _extract_segments(page, cfg: "LimitConfig") -> Tuple[List[Tuple], List[Tuple]]:
-    """Retourne (segments_non_remplis, conduites_longues).
-
-    Les *conduites* sont restreintes aux calques de tuyauterie (cfg.pipe_layers)
-    pour ne pas placer la jonction sur un leader d'annotation/instrument.
-    """
-    nf: List[Tuple] = []
-    longs: List[Tuple] = []
-    for d in page.get_drawings():
-        filled = d.get("fill") is not None and d.get("type") in ("f", "fs")
-        is_pipe_layer = d.get("layer") in cfg.pipe_layers
-        for it in d["items"]:
-            if it[0] != "l":
-                continue
-            s = (it[1].x, it[1].y, it[2].x, it[2].y)
-            L = math.hypot(s[2] - s[0], s[3] - s[1])
-            if not filled:
-                nf.append((s, L))
-            if L >= 18.0 and is_pipe_layer:
-                longs.append(s)
-    return nf, longs
-
-
-def _hollow_triangles(nf, cfg: LimitConfig):
-    """Triangles creux isolés (hors soupapes à sommet partagé)."""
-    small = [s for s, L in nf if cfg.tri_min <= L <= cfg.tri_max]
-
-    def key(x, y):
-        return (round(x), round(y))
-
-    adj = defaultdict(set)
-    for s in small:
-        a, b = key(s[0], s[1]), key(s[2], s[3])
-        adj[a].add(b)
-        adj[b].add(a)
-    edges = set((key(s[0], s[1]), key(s[2], s[3])) for s in small)
-    tris = set()
-    for a, b in edges:
-        for c in adj.get(a, ()):
-            if c != b and c in adj.get(b, ()):
-                tris.add(tuple(sorted([a, b, c])))
-    # exclusion soupapes : triangle partageant un sommet avec un autre triangle
-    vcount = Counter()
-    for t in tris:
-        for v in t:
-            vcount[v] += 1
-    solo = [t for t in tris if all(vcount[v] == 1 for v in t)]
-    cents = [(sum(p[0] for p in t) / 3, sum(p[1] for p in t) / 3) for t in solo]
-    uniq = []
-    for c in sorted(cents):
-        if all(abs(c[0] - u[0]) > cfg.dedup or abs(c[1] - u[1]) > cfg.dedup for u in uniq):
-            uniq.append(c)
-    return uniq
+def _seg_of_item(it) -> Tuple[float, float, float, float]:
+    """Renvoie (x1,y1,x2,y2) pour un item ligne 'l' ou courbe 'c' (corde)."""
+    if it[0] == "l":
+        return (it[1].x, it[1].y, it[2].x, it[2].y)
+    if it[0] == "c":
+        ps = it[1:]
+        return (ps[0].x, ps[0].y, ps[-1].x, ps[-1].y)
+    return None
 
 
 def _foot(px, py, s):
@@ -143,81 +79,64 @@ def _foot(px, py, s):
 
 
 def detect_line_limits(page, cfg: LimitConfig = LimitConfig()) -> List[dict]:
-    """Détecte les « Limite de ligne » et la jonction sur la conduite.
+    """Détecte les « Limite de ligne » (par calque) et place le point sur la conduite.
 
-    Retourne une liste de dicts : {triangle:(x,y), point:(x,y)} en coords PDF
+    Retourne une liste de dicts : {symbol:(x,y), point:(x,y)} en coords PDF
     (espace non roté de la page).
     """
     rot = page.rotation
     page.set_rotation(0)
-    nf, longs = _extract_segments(page, cfg)
-    tris = _hollow_triangles(nf, cfg)
 
-    # micro-traits (glyphes de pente/calo) : centres des très courts segments
-    micro = [((s[0] + s[2]) / 2, (s[1] + s[3]) / 2)
-             for s, L in nf if 0.1 < L < cfg.micro_len_max]
-
-    def _refine(cx, cy, near, base):
-        """Raffine le point sur le terminal du connecteur court (coin de conduite)."""
-        cand = []
-        for s, L in nf:
-            if not (3.0 <= L <= cfg.connector_short_max):
+    sym_segs: List[Tuple] = []   # traits du calque symbole
+    longs: List[Tuple] = []      # conduites (calques tuyauterie, >= 18pt)
+    for d in page.get_drawings():
+        lay = d.get("layer")
+        on_pipe_layer = lay in cfg.pipe_layers
+        is_symbol = lay == cfg.symbol_layer
+        for it in d["items"]:
+            s = _seg_of_item(it)
+            if s is None:
                 continue
-            for (ex, ey), (ox, oy) in (((s[0], s[1]), (s[2], s[3])),
-                                       ((s[2], s[3]), (s[0], s[1]))):
-                if math.hypot(ox - cx, oy - cy) > cfg.connector_reach - 1:
-                    continue
-                if any(_foot(ex, ey, P)[1] < cfg.on_pipe_tol for P in near):
-                    cand.append((ex, ey))
-        if not cand:
-            return base
-        pt = max(cand, key=lambda e: math.hypot(e[0] - cx, e[1] - cy))
-        return pt if math.hypot(pt[0] - base[0], pt[1] - base[1]) < cfg.refine_max_shift else base
+            if is_symbol:
+                sym_segs.append(s)
+            if on_pipe_layer and math.hypot(s[2] - s[0], s[3] - s[1]) >= 18.0:
+                longs.append(s)
 
+    # 1) regrouper les traits du calque symbole en symboles distincts
+    clusters: List[list] = []   # [cx, cy, [segs]]
+    for s in sym_segs:
+        mx, my = (s[0] + s[2]) / 2, (s[1] + s[3]) / 2
+        placed = False
+        for cl in clusters:
+            if math.hypot(cl[0] - mx, cl[1] - my) < cfg.cluster_tol:
+                cl[2].append(s)
+                n = len(cl[2])
+                cl[0] = (cl[0] * (n - 1) + mx) / n
+                cl[1] = (cl[1] * (n - 1) + my) / n
+                placed = True
+                break
+        if not placed:
+            clusters.append([mx, my, [s]])
+
+    # 2) placer le point sur la conduite
     results = []
-    for cx, cy in tris:
-        # densité d'encre -> exclut flèches pleines
-        pix = page.get_pixmap(matrix=fitz.Matrix(10, 10),
-                              clip=fitz.Rect(cx - 9, cy - 9, cx + 9, cy + 9))
-        im = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)
-        if (cv2.cvtColor(im, cv2.COLOR_RGB2GRAY) < 128).mean() > cfg.ink_max:
-            continue
+    for cx, cy, segs in clusters:
         near = [L for L in longs if _foot(cx, cy, L)[1] < cfg.pipe_search]
-        if not near:
-            continue
-        # jonction : extrémité d'un segment touchant la conduite, l'autre bout
-        # près du triangle (le connecteur coudé du symbole)
-        junction, best = None, 1e9
-        for s, L in nf:
-            for (ex, ey), (ox, oy) in (((s[0], s[1]), (s[2], s[3])),
-                                       ((s[2], s[3]), (s[0], s[1]))):
-                if math.hypot(ox - cx, oy - cy) > cfg.connector_reach:
-                    continue
-                for P in near:
-                    if _foot(ex, ey, P)[1] < cfg.on_pipe_tol:
-                        dtri = math.hypot(ex - cx, ey - cy)
-                        if dtri < best:
-                            best, junction = dtri, (ex, ey)
-        if junction is None:
-            junction = min((_foot(cx, cy, L) for L in near), key=lambda r: r[1])[0]
-        # Exclusion « Changement de classe/calo » : à leur jonction, DEUX
-        # extrémités de conduite se rejoignent (la ligne continue), alors qu'un
-        # vrai « Limite de ligne » n'en a qu'une.
-        nend = sum(
-            1 for L in longs for ex, ey in ((L[0], L[1]), (L[2], L[3]))
-            if math.hypot(ex - junction[0], ey - junction[1]) < 3.0
-        )
-        if cfg.filter_changement and nend >= 2:
-            continue
-        # (Optionnel) exclusion « Pente / Calo » par micro-traits de glyphe près
-        # du triangle. Désactivé par défaut : trop large (se déclenche aussi sur
-        # les repères de vannes), il supprimait des line breaks posés sur vanne.
-        if cfg.filter_micro and sum(
-                1 for x, y in micro if math.hypot(x - cx, y - cy) < cfg.micro_radius) >= 1:
-            continue
-        # Point affiché : raffiné sur le coin réel (le filtrage reste sur `junction`).
-        point = _refine(cx, cy, near, junction)
-        results.append({"triangle": (cx, cy), "point": point})
+        if near:
+            # extrémité d'un trait du symbole qui touche une conduite
+            junction, best = None, 1e9
+            for s in segs:
+                for ex, ey in ((s[0], s[1]), (s[2], s[3])):
+                    for L in near:
+                        if _foot(ex, ey, L)[1] < cfg.on_pipe_tol:
+                            d = math.hypot(ex - cx, ey - cy)
+                            if d < best:
+                                best, junction = d, (ex, ey)
+            if junction is None:  # repli : projection du centre sur la conduite
+                junction = min((_foot(cx, cy, L) for L in near), key=lambda r: r[1])[0]
+        else:
+            junction = (cx, cy)
+        results.append({"symbol": (cx, cy), "point": junction})
 
     page.set_rotation(rot)
     return results
@@ -230,7 +149,7 @@ def annotate(page, results: List[dict], cfg: LimitConfig) -> np.ndarray:
     pix = page.get_pixmap(matrix=fitz.Matrix(z, z))
     img = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR).copy()
-    for i, r in enumerate(results, 1):
+    for r in results:
         P = fitz.Point(*r["point"]) * M * z
         x, y = int(P.x), int(P.y)
         cv2.circle(img, (x, y), cfg.dot_radius, (255, 0, 0), -1)
@@ -242,15 +161,17 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Détection des « Limite de ligne » sur P&ID PDF.")
     ap.add_argument("--pdf", required=True, help="P&ID vectoriel (PDF)")
     ap.add_argument("--page", type=int, default=0)
+    ap.add_argument("--symbol-layer", default="14",
+                    help="calque CAO des symboles « Limite de ligne » (défaut: 14)")
     ap.add_argument("--outdir", default="out")
     args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
     doc = fitz.open(args.pdf)
     page = doc[args.page]
-    cfg = LimitConfig()
+    cfg = LimitConfig(symbol_layer=args.symbol_layer)
     results = detect_line_limits(page, cfg)
-    print(f"[OK] {len(results)} « Limite de ligne » détectés")
+    print(f"[OK] {len(results)} « Limite de ligne » détectés (calque {cfg.symbol_layer})")
 
     img = annotate(page, results, cfg)
     img_path = os.path.join(args.outdir, "line_limits.png")
