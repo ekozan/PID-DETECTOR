@@ -67,6 +67,7 @@ class LimitConfig:
     # calo). Présence de tels micro-segments près du triangle => on exclut.
     micro_len_max: float = 2.2    # longueur max d'un "micro-trait" de glyphe (pt)
     micro_radius: float = 20.0    # rayon de recherche autour du triangle (pt)
+    filter_micro: bool = False    # exclusion Pente/Calo par micro-traits (trop large -> off)
     # --- raffinement du point (post-traitement) ---
     connector_short_max: float = 12.0  # longueur max d'un connecteur du symbole (pt)
     refine_max_shift: float = 14.0     # déplacement max autorisé du point raffiné (pt)
@@ -199,9 +200,11 @@ def detect_line_limits(page, cfg: LimitConfig = LimitConfig()) -> List[dict]:
         )
         if nend >= 2:
             continue
-        # Exclusion « Pente / Calo » : micro-traits de glyphe près du triangle.
-        if sum(1 for x, y in micro
-               if math.hypot(x - cx, y - cy) < cfg.micro_radius) >= 1:
+        # (Optionnel) exclusion « Pente / Calo » par micro-traits de glyphe près
+        # du triangle. Désactivé par défaut : trop large (se déclenche aussi sur
+        # les repères de vannes), il supprimait des line breaks posés sur vanne.
+        if cfg.filter_micro and sum(
+                1 for x, y in micro if math.hypot(x - cx, y - cy) < cfg.micro_radius) >= 1:
             continue
         # Point affiché : raffiné sur le coin réel (le filtrage reste sur `junction`).
         point = _refine(cx, cy, near, junction)
