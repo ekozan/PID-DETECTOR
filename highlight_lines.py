@@ -72,6 +72,9 @@ class HighlightConfig:
     line_thickness: int = 8        # épaisseur trait (rendu PNG, px)
     pdf_line_width: float = 3.5    # épaisseur trait surligné (PDF, pt)
     pdf_dot_radius: float = 3.0    # rayon point bleu (PDF, pt)
+    pdf_arrow_len: float = 14.0    # longueur de la flèche line break (pt)
+    pdf_arrow_head: float = 5.0    # taille de la pointe (pt)
+    pdf_arrow_width: float = 1.5   # épaisseur de la flèche (pt)
     alpha: float = 0.6
     default_color: str = "#B0B0B0" # couleur des lignes sans couleur Excel
     dot_radius: int = 8
@@ -300,13 +303,26 @@ def _hex_to_rgb01(h: str) -> Tuple[float, float, float]:
     return (int(h[0:2], 16) / 255, int(h[2:4], 16) / 255, int(h[4:6], 16) / 255)
 
 
-def annotate_pdf(doc, page, pipes, label, colors, blue, cfg: HighlightConfig,
+def _arrow_endpoints(symbol, point, length):
+    """Flèche pointant vers la conduite : queue = recul depuis `point` dans la
+    direction symbole->point ; pointe = `point` (sur la conduite)."""
+    dx, dy = point[0] - symbol[0], point[1] - symbol[1]
+    n = math.hypot(dx, dy)
+    if n < 1e-6:
+        return (point[0], point[1] - length), point  # défaut : vers le bas
+    ux, uy = dx / n, dy / n
+    tail = (point[0] - ux * length, point[1] - uy * length)
+    return tail, point
+
+
+def annotate_pdf(doc, page, pipes, label, colors, lb, cfg: HighlightConfig,
                  out_path: str) -> None:
     """Dessine les surlignages (vectoriels) sur la page et sauve un PDF annoté.
 
     Les coordonnées des tuyaux sont en espace MediaBox (non roté), ce que les
     méthodes de dessin PyMuPDF utilisent directement ; la rotation de la page
-    est conservée pour l'affichage.
+    est conservée pour l'affichage. Chaque line break est marqué par une
+    **flèche bleue** orientée vers la conduite (sens de connexion).
     """
     default = _hex_to_rgb01(cfg.default_color)
     # une forme par couleur (regroupe les traits) pour un PDF compact
@@ -324,16 +340,23 @@ def annotate_pdf(doc, page, pipes, label, colors, blue, cfg: HighlightConfig,
         shape.finish(color=rgb, width=cfg.pdf_line_width,
                      stroke_opacity=cfg.alpha, lineCap=1)
         shape.commit()
-    # points bleus (changement de ligne)
+    # flèches bleues aux line breaks (sens de connexion vers la conduite)
     shape = page.new_shape()
-    for b in blue:
-        shape.draw_circle(fitz.Point(*b), cfg.pdf_dot_radius)
-    shape.finish(color=(0, 0, 0), fill=(0, 0, 1), width=0.5)
+    hs = cfg.pdf_arrow_head
+    for r in lb:
+        tail, tip = _arrow_endpoints(r.get("symbol", r["point"]), r["point"], cfg.pdf_arrow_len)
+        shape.draw_line(fitz.Point(*tail), fitz.Point(*tip))
+        ang = math.atan2(tip[1] - tail[1], tip[0] - tail[0])
+        for da in (math.radians(150), math.radians(-150)):
+            hx = tip[0] + hs * math.cos(ang + da)
+            hy = tip[1] + hs * math.sin(ang + da)
+            shape.draw_line(fitz.Point(*tip), fitz.Point(hx, hy))
+    shape.finish(color=(0, 0, 1), width=cfg.pdf_arrow_width, lineCap=1)
     shape.commit()
     doc.save(out_path, garbage=3, deflate=True)
 
 
-def render_highlight(page, pipes, label, colors, blue, cfg: HighlightConfig) -> np.ndarray:
+def render_highlight(page, pipes, label, colors, lb, cfg: HighlightConfig) -> np.ndarray:
     M = page.rotation_matrix
     z = cfg.render_zoom
     pix = page.get_pixmap(matrix=fitz.Matrix(z, z))
@@ -350,10 +373,13 @@ def render_highlight(page, pipes, label, colors, blue, cfg: HighlightConfig) -> 
         cv2.line(ov, (int(P1.x), int(P1.y)), (int(P2.x), int(P2.y)),
                  bgr, cfg.line_thickness, cv2.LINE_AA)
     img = cv2.addWeighted(ov, cfg.alpha, img, 1 - cfg.alpha, 0)
-    for b in blue:
-        P = fitz.Point(*b) * M * z
-        cv2.circle(img, (int(P.x), int(P.y)), cfg.dot_radius, (255, 0, 0), -1)
-        cv2.circle(img, (int(P.x), int(P.y)), cfg.dot_radius, (0, 0, 0), 1)
+    # flèches bleues aux line breaks (sens de connexion)
+    for r in lb:
+        tail, tip = _arrow_endpoints(r.get("symbol", r["point"]), r["point"], cfg.pdf_arrow_len)
+        T = fitz.Point(*tail) * M * z
+        H = fitz.Point(*tip) * M * z
+        cv2.arrowedLine(img, (int(T.x), int(T.y)), (int(H.x), int(H.y)),
+                        (255, 0, 0), 3, cv2.LINE_AA, tipLength=0.45)
     return img
 
 
@@ -364,10 +390,11 @@ def process(pdf, page_no, excel, outdir, make_template, also_png, cfg: Highlight
     page = doc[page_no]
     orig_rot = page.rotation  # conserver l'orientation d'affichage d'origine
 
-    # 1) points bleus
-    blue = [r["point"] for r in detect_line_limits(page, LimitConfig())]
+    # 1) line breaks (symbole + point sur la conduite)
+    lb = detect_line_limits(page, LimitConfig())
+    blue = [r["point"] for r in lb]
     page.set_rotation(0)
-    print(f"[1] {len(blue)} « Limite de ligne » (points bleus)")
+    print(f"[1] {len(lb)} « Limite de ligne »")
 
     # 2-3) réseau + marquages
     pipes = build_pipes(page, cfg)
@@ -394,11 +421,11 @@ def process(pdf, page_no, excel, outdir, make_template, also_png, cfg: Highlight
     # 6) sortie PDF annoté (vectoriel) — on restaure l'orientation d'affichage
     page.set_rotation(orig_rot)
     out_pdf = os.path.join(outdir, "highlight.pdf")
-    annotate_pdf(doc, page, pipes, label, colors, blue, cfg, out_pdf)
+    annotate_pdf(doc, page, pipes, label, colors, lb, cfg, out_pdf)
     print(f"[5] PDF annoté : {out_pdf}")
 
     if also_png:
-        img = render_highlight(page, pipes, label, colors, blue, cfg)
+        img = render_highlight(page, pipes, label, colors, lb, cfg)
         out_img = os.path.join(outdir, "highlight.png")
         cv2.imwrite(out_img, img)
         print(f"    PNG : {out_img}")
