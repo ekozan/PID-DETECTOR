@@ -76,8 +76,13 @@ Options principales :
 Tous les seuils sont centralisés et réglables dans la dataclass `Config`
 (en haut de `pid_detector.py`). Le preset **`real_plan`** applique :
 `merge_gap_tol=160`, `reconnect_max_dist=250`, `node_snap_tol=40`,
-`reconnect_align_tol=18`, `angle_tol_deg=6` — valeurs calibrées sur un plan
-scanné réel où la conduite principale traverse vannes, nuages et ruptures.
+`reconnect_align_tol=18`, `angle_tol_deg=6`, `ocr_upscale=3.0` — valeurs
+calibrées sur un plan scanné réel où la conduite principale traverse vannes,
+nuages et ruptures. L'**upscale OCR** (×3) est essentiel : sur un scan basse
+résolution, le texte des marquages est trop petit à l'échelle native ; on
+agrandit avant lecture puis on reprojette les coordonnées. Validé sur plan réel :
+le produit `AZOTE` est lu et associé à la bonne ligne, et
+`--highlight-label AZOTE` la surligne automatiquement.
 
 ## Sorties
 

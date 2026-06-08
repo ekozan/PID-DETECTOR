@@ -93,6 +93,7 @@ class Config:
     ocr_engine: str = "easyocr"       # "easyocr" | "tesseract"
     ocr_languages: Tuple[str, ...] = ("en",)
     ocr_min_confidence: float = 0.30
+    ocr_upscale: float = 1.0          # facteur d'agrandissement avant OCR (petit texte)
     text_to_line_max_dist: int = 80   # distance texte->ligne max pour association (px)
 
     # --- Détection des flèches (bonus) ---
@@ -140,6 +141,8 @@ PRESETS: Dict[str, dict] = {
         reconnect_max_dist=250,
         reconnect_align_tol=18,
         draw_thickness=4,
+        ocr_upscale=3.0,          # plans scannés : petit texte -> agrandir avant OCR
+        ocr_min_confidence=0.25,
     ),
 }
 
@@ -635,14 +638,28 @@ def run_ocr(img: np.ndarray, cfg: Config) -> List[TextItem]:
 
     import re
 
+    # Agrandissement optionnel : sur les plans scannés, le texte le long des
+    # lignes est minuscule et l'OCR échoue à l'échelle native. On agrandit,
+    # on lit, puis on reprojette les coordonnées à l'échelle d'origine.
+    scale = max(1.0, float(cfg.ocr_upscale))
+    ocr_img = img
+    if scale > 1.0:
+        ocr_img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
     try:
         if cfg.ocr_engine == "tesseract":
-            raw = _ocr_tesseract(img, cfg)
+            raw = _ocr_tesseract(ocr_img, cfg)
         else:
-            raw = _ocr_easyocr(img, cfg)
+            raw = _ocr_easyocr(ocr_img, cfg)
     except Exception as exc:  # moteur absent / échec : on dégrade proprement
         print(f"[OCR] désactivé ({exc})")
         return []
+
+    if scale > 1.0:  # reprojette les bbox vers l'échelle native
+        raw = [
+            (t, (int(x / scale), int(y / scale), int(w / scale), int(h / scale)), c)
+            for t, (x, y, w, h), c in raw
+        ]
 
     patterns = [re.compile(p, re.IGNORECASE) for p in cfg.ocr_keep_patterns]
     items: List[TextItem] = []
