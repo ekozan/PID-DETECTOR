@@ -66,7 +66,9 @@ class HighlightConfig:
     mark_cls_dist: float = 60.0    # distance num<->classe (pt)
     seed_dist: float = 25.0        # distance max marquage<->tuyau pour amorcer (pt)
     render_zoom: float = 3.0
-    line_thickness: int = 8
+    line_thickness: int = 8        # épaisseur trait (rendu PNG, px)
+    pdf_line_width: float = 3.5    # épaisseur trait surligné (PDF, pt)
+    pdf_dot_radius: float = 3.0    # rayon point bleu (PDF, pt)
     alpha: float = 0.6
     default_color: str = "#B0B0B0" # couleur des lignes sans couleur Excel
     dot_radius: int = 8
@@ -255,6 +257,46 @@ def _hex_to_bgr(h: str) -> Tuple[int, int, int]:
 # ----------------------------------------------------------------------------
 #  Rendu
 # ----------------------------------------------------------------------------
+def _hex_to_rgb01(h: str) -> Tuple[float, float, float]:
+    h = h.lstrip("#")
+    if len(h) != 6:
+        return (0.69, 0.69, 0.69)
+    return (int(h[0:2], 16) / 255, int(h[2:4], 16) / 255, int(h[4:6], 16) / 255)
+
+
+def annotate_pdf(doc, page, pipes, label, colors, blue, cfg: HighlightConfig,
+                 out_path: str) -> None:
+    """Dessine les surlignages (vectoriels) sur la page et sauve un PDF annoté.
+
+    Les coordonnées des tuyaux sont en espace MediaBox (non roté), ce que les
+    méthodes de dessin PyMuPDF utilisent directement ; la rotation de la page
+    est conservée pour l'affichage.
+    """
+    default = _hex_to_rgb01(cfg.default_color)
+    # une forme par couleur (regroupe les traits) pour un PDF compact
+    by_color: Dict[Tuple[float, float, float], List[Pipe]] = defaultdict(list)
+    for i, p in enumerate(pipes):
+        if i not in label:
+            continue
+        rgb = _hex_to_rgb01(colors[label[i]]) if label[i] in colors else default
+        by_color[rgb].append(p)
+    for rgb, plist in by_color.items():
+        shape = page.new_shape()
+        for p in plist:
+            shape.draw_line(fitz.Point(*p[0]), fitz.Point(*p[1]))
+        # trait épais translucide = effet surligneur, le tuyau noir reste lisible
+        shape.finish(color=rgb, width=cfg.pdf_line_width,
+                     stroke_opacity=cfg.alpha, lineCap=1)
+        shape.commit()
+    # points bleus (changement de ligne)
+    shape = page.new_shape()
+    for b in blue:
+        shape.draw_circle(fitz.Point(*b), cfg.pdf_dot_radius)
+    shape.finish(color=(0, 0, 0), fill=(0, 0, 1), width=0.5)
+    shape.commit()
+    doc.save(out_path, garbage=3, deflate=True)
+
+
 def render_highlight(page, pipes, label, colors, blue, cfg: HighlightConfig) -> np.ndarray:
     M = page.rotation_matrix
     z = cfg.render_zoom
@@ -280,10 +322,11 @@ def render_highlight(page, pipes, label, colors, blue, cfg: HighlightConfig) -> 
 
 
 # ----------------------------------------------------------------------------
-def process(pdf, page_no, excel, outdir, make_template, cfg: HighlightConfig):
+def process(pdf, page_no, excel, outdir, make_template, also_png, cfg: HighlightConfig):
     os.makedirs(outdir, exist_ok=True)
     doc = fitz.open(pdf)
     page = doc[page_no]
+    orig_rot = page.rotation  # conserver l'orientation d'affichage d'origine
 
     # 1) points bleus
     blue = [r["point"] for r in detect_line_limits(page, LimitConfig())]
@@ -312,12 +355,17 @@ def process(pdf, page_no, excel, outdir, make_template, cfg: HighlightConfig):
     colors = read_colors(excel)
     print(f"[4] {len(colors)} couleur(s) lue(s) depuis {excel}")
 
-    # 6) rendu
-    page.set_rotation(page.rotation if page.rotation else 270)
-    img = render_highlight(page, pipes, label, colors, blue, cfg)
-    out_img = os.path.join(outdir, "highlight.png")
-    cv2.imwrite(out_img, img)
-    print(f"[5] Image surlignée : {out_img}")
+    # 6) sortie PDF annoté (vectoriel) — on restaure l'orientation d'affichage
+    page.set_rotation(orig_rot)
+    out_pdf = os.path.join(outdir, "highlight.pdf")
+    annotate_pdf(doc, page, pipes, label, colors, blue, cfg, out_pdf)
+    print(f"[5] PDF annoté : {out_pdf}")
+
+    if also_png:
+        img = render_highlight(page, pipes, label, colors, blue, cfg)
+        out_img = os.path.join(outdir, "highlight.png")
+        cv2.imwrite(out_img, img)
+        print(f"    PNG : {out_img}")
 
 
 def main() -> int:
@@ -329,8 +377,10 @@ def main() -> int:
     ap.add_argument("--make-template", action="store_true",
                     help="Génère le template Excel pré-rempli et sort")
     ap.add_argument("--outdir", default="out")
+    ap.add_argument("--png", action="store_true", help="produit aussi un PNG")
     args = ap.parse_args()
-    process(args.pdf, args.page, args.excel, args.outdir, args.make_template, HighlightConfig())
+    process(args.pdf, args.page, args.excel, args.outdir, args.make_template,
+            args.png, HighlightConfig())
     return 0
 
 
