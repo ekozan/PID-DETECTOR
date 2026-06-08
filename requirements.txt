@@ -1,0 +1,9 @@
+# Core computer-vision / numerical stack
+opencv-python>=4.8.0
+numpy>=1.24.0
+networkx>=3.0
+
+# OCR engine. EasyOCR is the recommended default (pure-python install, GPU optional).
+# pytesseract is supported as a fallback (requires the Tesseract binary installed on the system).
+easyocr>=1.7.0
+# pytesseract>=0.3.10
