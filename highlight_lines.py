@@ -55,7 +55,10 @@ from detect_line_limits import LimitConfig, detect_line_limits
 
 @dataclass
 class HighlightConfig:
-    pipe_min_len: float = 8.0      # longueur min d'un segment de tuyau (pt)
+    # Calques CAO des tuyaux à colorier (les instruments, vannes, équipements et
+    # le cartouche sont sur d'autres calques et ne sont PAS coloriés).
+    pipe_layers: Tuple[str, ...] = ("UTI",)
+    pipe_min_len: float = 6.0      # longueur min d'un segment de tuyau (pt)
     merge_gap: float = 35.0        # trou max ponté entre 2 segments collinéaires (pt)
     merge_tol: float = 2.5         # tolérance transversale de colinéarité (pt)
     cut_tol: float = 4.0           # tolérance "point bleu sur le tuyau" (pt)
@@ -104,6 +107,8 @@ def build_pipes(page, cfg: HighlightConfig) -> List[Pipe]:
     """Extrait et fusionne les tuyaux horizontaux/verticaux (non remplis)."""
     H, V = [], []
     for dr in page.get_drawings():
+        if dr.get("layer") not in cfg.pipe_layers:
+            continue  # ne colorier que les calques de tuyauterie
         if dr.get("fill") is not None and dr.get("type") in ("f", "fs"):
             continue
         for it in dr["items"]:
@@ -161,23 +166,72 @@ def split_pipes(pipes: List[Pipe], blue, cfg: HighlightConfig) -> List[Pipe]:
     return out
 
 
-def build_adjacency(pipes: List[Pipe], blue, cfg: HighlightConfig) -> Dict[int, set]:
-    """Relie deux tuyaux qui se touchent, SAUF au niveau d'un point bleu (coupure)."""
+def build_adjacency(pipes: List[Pipe], blue, cfg: HighlightConfig):
+    """Adjacence entre tuyaux qui se touchent, séparée en :
+       - STRONG : jonction normale (même ligne),
+       - WEAK   : jonction au niveau d'un point bleu (changement de ligne possible).
+    """
     def near_blue(pt):
         return any(math.hypot(pt[0] - b[0], pt[1] - b[1]) < cfg.blue_block for b in blue)
 
-    adj: Dict[int, set] = defaultdict(set)
+    strong: Dict[int, set] = defaultdict(set)
+    weak: Dict[int, set] = defaultdict(set)
     for i, p in enumerate(pipes):
         for e in (tuple(p[0]), tuple(p[1])):
-            if near_blue(e):
-                continue
+            at_blue = near_blue(e)
             for j, q in enumerate(pipes):
                 if j == i:
                     continue
                 if _dist_pt_pipe(e, q) < cfg.junction_tol:
-                    adj[i].add(j)
-                    adj[j].add(i)
-    return adj
+                    (weak if at_blue else strong)[i].add(j)
+                    (weak if at_blue else strong)[j].add(i)
+    return strong, weak
+
+
+def assign_lines(pipes, strong, weak, markings, cfg: HighlightConfig) -> Dict[int, str]:
+    """Segmente en *runs* (tuyaux reliés sans franchir un point bleu) puis :
+       - un run portant un marquage prend ce numéro de ligne ;
+       - un run sans marquage **hérite** du run voisin à travers un point bleu
+         (règle : au point bleu on ne change de ligne que si le tronçon suivant a
+         son propre numéro ; sinon on reste sur la ligne courante).
+    """
+    n = len(pipes)
+    run = [-1] * n
+    rid = 0
+    for i in range(n):
+        if run[i] >= 0:
+            continue
+        run[i] = rid
+        dq = deque([i])
+        while dq:
+            u = dq.popleft()
+            for w in strong[u]:
+                if run[w] < 0:
+                    run[w] = rid
+                    dq.append(w)
+        rid += 1
+    # numéro de chaque run = marquage le plus proche d'un de ses tuyaux
+    run_num: Dict[int, str] = {}
+    for num, mp in markings:
+        bi = min(range(n), key=lambda i: _dist_pt_pipe(mp, pipes[i]))
+        if _dist_pt_pipe(mp, pipes[bi]) < cfg.seed_dist and run[bi] not in run_num:
+            run_num[run[bi]] = num
+    # graphe entre runs via jonctions WEAK (à travers les points bleus)
+    run_adj: Dict[int, set] = defaultdict(set)
+    for i in weak:
+        for j in weak[i]:
+            if run[i] != run[j]:
+                run_adj[run[i]].add(run[j])
+                run_adj[run[j]].add(run[i])
+    # héritage : propage les numéros aux runs voisins non numérotés
+    dq = deque(run_num.keys())
+    while dq:
+        r = dq.popleft()
+        for nb in run_adj[r]:
+            if nb not in run_num:
+                run_num[nb] = run_num[r]
+                dq.append(nb)
+    return {i: run_num[run[i]] for i in range(n) if run[i] in run_num}
 
 
 # ----------------------------------------------------------------------------
@@ -196,24 +250,6 @@ def extract_line_markings(page, cfg: HighlightConfig) -> List[Tuple[str, Tuple[f
            any(math.hypot(x - cx, y - cy) < cfg.mark_cls_dist for cx, cy in cls):
             out.append((t, (x, y)))
     return out
-
-
-def assign_lines(pipes, adj, markings, cfg: HighlightConfig) -> Dict[int, str]:
-    """Flood-fill : chaque tuyau prend le numéro du marquage le plus proche."""
-    label: Dict[int, str] = {}
-    dq = deque()
-    for num, p in markings:
-        bi = min(range(len(pipes)), key=lambda i: _dist_pt_pipe(p, pipes[i]))
-        if _dist_pt_pipe(p, pipes[bi]) < cfg.seed_dist and bi not in label:
-            label[bi] = num
-            dq.append(bi)
-    while dq:
-        u = dq.popleft()
-        for w in adj[u]:
-            if w not in label:
-                label[w] = label[u]
-                dq.append(w)
-    return label
 
 
 # ----------------------------------------------------------------------------
@@ -336,12 +372,12 @@ def process(pdf, page_no, excel, outdir, make_template, also_png, cfg: Highlight
     # 2-3) réseau + marquages
     pipes = build_pipes(page, cfg)
     pipes = split_pipes(pipes, blue, cfg)
-    adj = build_adjacency(pipes, blue, cfg)
+    strong, weak = build_adjacency(pipes, blue, cfg)
     markings = extract_line_markings(page, cfg)
-    print(f"[2] {len(pipes)} tuyaux | {len(markings)} marquages de ligne")
+    print(f"[2] {len(pipes)} tuyaux (calques {cfg.pipe_layers}) | {len(markings)} marquages")
 
-    # 4) attribution des numéros
-    label = assign_lines(pipes, adj, markings, cfg)
+    # 4) attribution des numéros (runs + héritage)
+    label = assign_lines(pipes, strong, weak, markings, cfg)
     detected = sorted(set(label.values()))
     print(f"[3] {len(label)}/{len(pipes)} tuyaux étiquetés | {len(detected)} lignes : {detected}")
 
@@ -378,9 +414,13 @@ def main() -> int:
                     help="Génère le template Excel pré-rempli et sort")
     ap.add_argument("--outdir", default="out")
     ap.add_argument("--png", action="store_true", help="produit aussi un PNG")
+    ap.add_argument("--pipe-layers", default="UTI",
+                    help="calques de tuyauterie à colorier, séparés par des virgules "
+                         "(défaut: UTI ; ex: UTI,0 pour plus de couverture)")
     args = ap.parse_args()
+    cfg = HighlightConfig(pipe_layers=tuple(s.strip() for s in args.pipe_layers.split(",") if s.strip()))
     process(args.pdf, args.page, args.excel, args.outdir, args.make_template,
-            args.png, HighlightConfig())
+            args.png, cfg)
     return 0
 
 
