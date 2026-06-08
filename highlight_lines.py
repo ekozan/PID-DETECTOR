@@ -303,23 +303,18 @@ def _hex_to_rgb01(h: str) -> Tuple[float, float, float]:
     return (int(h[0:2], 16) / 255, int(h[2:4], 16) / 255, int(h[4:6], 16) / 255)
 
 
-def _line_dir(point, pipes, reverse):
-    """Direction unitaire **le long de la conduite** au point (colinéaire),
-    orientée vers le côté rupture (depuis l'extrémité opposée du tuyau)."""
-    if not pipes:
-        return (1.0, 0.0)
-    q = min(pipes, key=lambda p: _dist_pt_pipe(point, p))
-    e0, e1 = q[0], q[1]
-    far = e0 if math.hypot(point[0] - e0[0], point[1] - e0[1]) >= \
-        math.hypot(point[0] - e1[0], point[1] - e1[1]) else e1
-    dx, dy = point[0] - far[0], point[1] - far[1]
-    n = math.hypot(dx, dy)
-    if n < 1e-6:
-        # point à l'extrémité : utiliser l'orientation du tuyau
-        dx, dy = (1.0, 0.0) if q[2] == 'h' else (0.0, 1.0)
-        n = 1.0
-    ux, uy = dx / n, dy / n
-    return (-ux, -uy) if reverse else (ux, uy)
+def _lb_dir(r, pipes, reverse):
+    """Direction du chevron = **sens de l'apex du triangle** (r['dir']).
+    Repli sur l'orientation du tuyau si l'apex n'a pas pu être calculé."""
+    v = r.get("dir")
+    if v is None:
+        # repli : le long du tuyau le plus proche
+        if pipes:
+            q = min(pipes, key=lambda p: _dist_pt_pipe(r["point"], p))
+            v = (1.0, 0.0) if q[2] == 'h' else (0.0, 1.0)
+        else:
+            v = (1.0, 0.0)
+    return (-v[0], -v[1]) if reverse else v
 
 
 def _chevron_strokes(point, v, head):
@@ -361,7 +356,7 @@ def annotate_pdf(doc, page, pipes, label, colors, lb, cfg: HighlightConfig,
     # chevrons bleus '>' aux line breaks : colinéaires au tuyau, sens rupture
     shape = page.new_shape()
     for r in lb:
-        v = _line_dir(r["point"], pipes, cfg.arrow_reverse)
+        v = _lb_dir(r, pipes, cfg.arrow_reverse)
         tip, b1, b2 = _chevron_strokes(r["point"], v, cfg.pdf_arrow_head)
         shape.draw_line(fitz.Point(*b1), fitz.Point(*tip))
         shape.draw_line(fitz.Point(*tip), fitz.Point(*b2))
@@ -389,7 +384,7 @@ def render_highlight(page, pipes, label, colors, lb, cfg: HighlightConfig) -> np
     img = cv2.addWeighted(ov, cfg.alpha, img, 1 - cfg.alpha, 0)
     # chevrons bleus '>' colinéaires au tuyau
     for r in lb:
-        v = _line_dir(r["point"], pipes, cfg.arrow_reverse)
+        v = _lb_dir(r, pipes, cfg.arrow_reverse)
         tip, b1, b2 = _chevron_strokes(r["point"], v, cfg.pdf_arrow_head)
         T = fitz.Point(*tip) * M * z
         B1 = fitz.Point(*b1) * M * z

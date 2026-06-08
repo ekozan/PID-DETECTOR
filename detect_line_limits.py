@@ -78,6 +78,35 @@ def _foot(px, py, s):
     return (fx, fy), math.hypot(px - fx, py - fy)
 
 
+def _apex_dir(cx, cy, small):
+    """Direction de l'apex du triangle ▽ (le sens du symbole) : deux côtés de
+    longueurs ~égales se rejoignent à l'apex ; direction = milieu de la base
+    vers l'apex. `small` = petits segments (~4-10pt) proches."""
+    near = [s for s in small if abs((s[0] + s[2]) / 2 - cx) < 14 and abs((s[1] + s[3]) / 2 - cy) < 14]
+    best = None  # (longueur_cote, apex, base_mid)
+    for i in range(len(near)):
+        for j in range(i + 1, len(near)):
+            a, b = near[i], near[j]
+            la = math.hypot(a[2] - a[0], a[3] - a[1])
+            lb = math.hypot(b[2] - b[0], b[3] - b[1])
+            if abs(la - lb) > 2.5:
+                continue
+            for ax, ay, afx, afy in ((a[0], a[1], a[2], a[3]), (a[2], a[3], a[0], a[1])):
+                for bx, by, bfx, bfy in ((b[0], b[1], b[2], b[3]), (b[2], b[3], b[0], b[1])):
+                    if math.hypot(ax - bx, ay - by) < 2.5:   # sommet partagé = apex
+                        apex = ((ax + bx) / 2, (ay + by) / 2)
+                        bm = ((afx + bfx) / 2, (afy + bfy) / 2)
+                        side = (la + lb) / 2
+                        if best is None or side > best[0]:
+                            best = (side, apex, bm)
+    if best is None:
+        return None
+    _, apex, bm = best
+    dx, dy = apex[0] - bm[0], apex[1] - bm[1]
+    n = math.hypot(dx, dy)
+    return (dx / n, dy / n) if n > 1e-6 else None
+
+
 def detect_line_limits(page, cfg: LimitConfig = LimitConfig()) -> List[dict]:
     """Détecte les « Limite de ligne » (par calque) et place le point sur la conduite.
 
@@ -89,18 +118,23 @@ def detect_line_limits(page, cfg: LimitConfig = LimitConfig()) -> List[dict]:
 
     sym_segs: List[Tuple] = []   # traits du calque symbole
     longs: List[Tuple] = []      # conduites (calques tuyauterie, >= 18pt)
+    small: List[Tuple] = []      # petits traits (triangles ▽) pour le sens
     for d in page.get_drawings():
         lay = d.get("layer")
         on_pipe_layer = lay in cfg.pipe_layers
         is_symbol = lay == cfg.symbol_layer
+        filled = d.get("fill") is not None and d.get("type") in ("f", "fs")
         for it in d["items"]:
             s = _seg_of_item(it)
             if s is None:
                 continue
             if is_symbol:
                 sym_segs.append(s)
-            if on_pipe_layer and math.hypot(s[2] - s[0], s[3] - s[1]) >= 18.0:
+            L = math.hypot(s[2] - s[0], s[3] - s[1])
+            if on_pipe_layer and L >= 18.0:
                 longs.append(s)
+            if not filled and 4.0 <= L <= 10.0:
+                small.append(s)
 
     # 1) regrouper les traits du calque symbole en symboles distincts
     clusters: List[list] = []   # [cx, cy, [segs]]
@@ -136,10 +170,18 @@ def detect_line_limits(page, cfg: LimitConfig = LimitConfig()) -> List[dict]:
                 junction = min((_foot(cx, cy, L) for L in near), key=lambda r: r[1])[0]
         else:
             junction = (cx, cy)
-        results.append({"symbol": (cx, cy), "point": junction})
+        direction = _apex_dir(cx, cy, small)   # sens du triangle ▽
+        results.append({"symbol": (cx, cy), "point": junction, "dir": direction})
+
+    # dédoublonnage : symboles distincts projetés sur le même point
+    dedup = []
+    for r in results:
+        if all(math.hypot(r["point"][0] - u["point"][0],
+                          r["point"][1] - u["point"][1]) > 6.0 for u in dedup):
+            dedup.append(r)
 
     page.set_rotation(rot)
-    return results
+    return dedup
 
 
 def annotate(page, results: List[dict], cfg: LimitConfig) -> np.ndarray:
