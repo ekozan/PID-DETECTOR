@@ -224,3 +224,5 @@ out/
 out_*/
 *.jpg
 *.jpeg
+*.pdf
+*.npy
