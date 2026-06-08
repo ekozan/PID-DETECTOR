@@ -61,6 +61,15 @@ class LimitConfig:
     on_pipe_tol: float = 1.5      # tolérance "extrémité sur la conduite" (pt)
     connector_reach: float = 15.0 # distance max connecteur->triangle (pt)
     ink_max: float = 0.16         # densité d'encre max (exclut flèches pleines)
+    # --- exclusion Pente / Calo (template d'empreinte) ---
+    # Le bloc « Limite de ligne » pur n'a que ses ~6 segments nets. Pente et Calo
+    # portent en plus des micro-traits (glyphes de la valeur de pente / du repère
+    # calo). Présence de tels micro-segments près du triangle => on exclut.
+    micro_len_max: float = 2.2    # longueur max d'un "micro-trait" de glyphe (pt)
+    micro_radius: float = 20.0    # rayon de recherche autour du triangle (pt)
+    # --- raffinement du point (post-traitement) ---
+    connector_short_max: float = 12.0  # longueur max d'un connecteur du symbole (pt)
+    refine_max_shift: float = 14.0     # déplacement max autorisé du point raffiné (pt)
     render_zoom: float = 2.5      # zoom du rendu annoté
     dot_radius: int = 9
 
@@ -134,6 +143,27 @@ def detect_line_limits(page, cfg: LimitConfig = LimitConfig()) -> List[dict]:
     nf, longs = _extract_segments(page)
     tris = _hollow_triangles(nf, cfg)
 
+    # micro-traits (glyphes de pente/calo) : centres des très courts segments
+    micro = [((s[0] + s[2]) / 2, (s[1] + s[3]) / 2)
+             for s, L in nf if 0.1 < L < cfg.micro_len_max]
+
+    def _refine(cx, cy, near, base):
+        """Raffine le point sur le terminal du connecteur court (coin de conduite)."""
+        cand = []
+        for s, L in nf:
+            if not (3.0 <= L <= cfg.connector_short_max):
+                continue
+            for (ex, ey), (ox, oy) in (((s[0], s[1]), (s[2], s[3])),
+                                       ((s[2], s[3]), (s[0], s[1]))):
+                if math.hypot(ox - cx, oy - cy) > cfg.connector_reach - 1:
+                    continue
+                if any(_foot(ex, ey, P)[1] < cfg.on_pipe_tol for P in near):
+                    cand.append((ex, ey))
+        if not cand:
+            return base
+        pt = max(cand, key=lambda e: math.hypot(e[0] - cx, e[1] - cy))
+        return pt if math.hypot(pt[0] - base[0], pt[1] - base[1]) < cfg.refine_max_shift else base
+
     results = []
     for cx, cy in tris:
         # densité d'encre -> exclut flèches pleines
@@ -169,7 +199,13 @@ def detect_line_limits(page, cfg: LimitConfig = LimitConfig()) -> List[dict]:
         )
         if nend >= 2:
             continue
-        results.append({"triangle": (cx, cy), "point": junction})
+        # Exclusion « Pente / Calo » : micro-traits de glyphe près du triangle.
+        if sum(1 for x, y in micro
+               if math.hypot(x - cx, y - cy) < cfg.micro_radius) >= 1:
+            continue
+        # Point affiché : raffiné sur le coin réel (le filtrage reste sur `junction`).
+        point = _refine(cx, cy, near, junction)
+        results.append({"triangle": (cx, cy), "point": point})
 
     page.set_rotation(rot)
     return results
