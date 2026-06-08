@@ -72,9 +72,9 @@ class HighlightConfig:
     line_thickness: int = 8        # épaisseur trait (rendu PNG, px)
     pdf_line_width: float = 3.5    # épaisseur trait surligné (PDF, pt)
     pdf_dot_radius: float = 3.0    # rayon point bleu (PDF, pt)
-    pdf_arrow_len: float = 14.0    # longueur de la flèche line break (pt)
-    pdf_arrow_head: float = 5.0    # taille de la pointe (pt)
-    pdf_arrow_width: float = 1.5   # épaisseur de la flèche (pt)
+    pdf_arrow_head: float = 5.0    # taille du chevron '>' (pt)
+    pdf_arrow_width: float = 1.5   # épaisseur du chevron (pt)
+    arrow_reverse: bool = False    # inverser le sens du chevron
     alpha: float = 0.6
     default_color: str = "#B0B0B0" # couleur des lignes sans couleur Excel
     dot_radius: int = 8
@@ -303,16 +303,34 @@ def _hex_to_rgb01(h: str) -> Tuple[float, float, float]:
     return (int(h[0:2], 16) / 255, int(h[2:4], 16) / 255, int(h[4:6], 16) / 255)
 
 
-def _arrow_endpoints(symbol, point, length):
-    """Flèche pointant vers la conduite : queue = recul depuis `point` dans la
-    direction symbole->point ; pointe = `point` (sur la conduite)."""
-    dx, dy = point[0] - symbol[0], point[1] - symbol[1]
+def _line_dir(point, pipes, reverse):
+    """Direction unitaire **le long de la conduite** au point (colinéaire),
+    orientée vers le côté rupture (depuis l'extrémité opposée du tuyau)."""
+    if not pipes:
+        return (1.0, 0.0)
+    q = min(pipes, key=lambda p: _dist_pt_pipe(point, p))
+    e0, e1 = q[0], q[1]
+    far = e0 if math.hypot(point[0] - e0[0], point[1] - e0[1]) >= \
+        math.hypot(point[0] - e1[0], point[1] - e1[1]) else e1
+    dx, dy = point[0] - far[0], point[1] - far[1]
     n = math.hypot(dx, dy)
     if n < 1e-6:
-        return (point[0], point[1] - length), point  # défaut : vers le bas
+        # point à l'extrémité : utiliser l'orientation du tuyau
+        dx, dy = (1.0, 0.0) if q[2] == 'h' else (0.0, 1.0)
+        n = 1.0
     ux, uy = dx / n, dy / n
-    tail = (point[0] - ux * length, point[1] - uy * length)
-    return tail, point
+    return (-ux, -uy) if reverse else (ux, uy)
+
+
+def _chevron_strokes(point, v, head):
+    """Renvoie les 2 traits du chevron '>' (sans hampe), pointe sur `point`,
+    aligné sur la direction `v`."""
+    vx, vy = v
+    px, py = -vy, vx  # perpendiculaire
+    tip = (point[0] + vx * head, point[1] + vy * head)
+    b1 = (tip[0] - vx * head + px * head, tip[1] - vy * head + py * head)
+    b2 = (tip[0] - vx * head - px * head, tip[1] - vy * head - py * head)
+    return tip, b1, b2
 
 
 def annotate_pdf(doc, page, pipes, label, colors, lb, cfg: HighlightConfig,
@@ -340,17 +358,13 @@ def annotate_pdf(doc, page, pipes, label, colors, lb, cfg: HighlightConfig,
         shape.finish(color=rgb, width=cfg.pdf_line_width,
                      stroke_opacity=cfg.alpha, lineCap=1)
         shape.commit()
-    # flèches bleues aux line breaks (sens de connexion vers la conduite)
+    # chevrons bleus '>' aux line breaks : colinéaires au tuyau, sens rupture
     shape = page.new_shape()
-    hs = cfg.pdf_arrow_head
     for r in lb:
-        tail, tip = _arrow_endpoints(r.get("symbol", r["point"]), r["point"], cfg.pdf_arrow_len)
-        shape.draw_line(fitz.Point(*tail), fitz.Point(*tip))
-        ang = math.atan2(tip[1] - tail[1], tip[0] - tail[0])
-        for da in (math.radians(150), math.radians(-150)):
-            hx = tip[0] + hs * math.cos(ang + da)
-            hy = tip[1] + hs * math.sin(ang + da)
-            shape.draw_line(fitz.Point(*tip), fitz.Point(hx, hy))
+        v = _line_dir(r["point"], pipes, cfg.arrow_reverse)
+        tip, b1, b2 = _chevron_strokes(r["point"], v, cfg.pdf_arrow_head)
+        shape.draw_line(fitz.Point(*b1), fitz.Point(*tip))
+        shape.draw_line(fitz.Point(*tip), fitz.Point(*b2))
     shape.finish(color=(0, 0, 1), width=cfg.pdf_arrow_width, lineCap=1)
     shape.commit()
     doc.save(out_path, garbage=3, deflate=True)
@@ -373,13 +387,15 @@ def render_highlight(page, pipes, label, colors, lb, cfg: HighlightConfig) -> np
         cv2.line(ov, (int(P1.x), int(P1.y)), (int(P2.x), int(P2.y)),
                  bgr, cfg.line_thickness, cv2.LINE_AA)
     img = cv2.addWeighted(ov, cfg.alpha, img, 1 - cfg.alpha, 0)
-    # flèches bleues aux line breaks (sens de connexion)
+    # chevrons bleus '>' colinéaires au tuyau
     for r in lb:
-        tail, tip = _arrow_endpoints(r.get("symbol", r["point"]), r["point"], cfg.pdf_arrow_len)
-        T = fitz.Point(*tail) * M * z
-        H = fitz.Point(*tip) * M * z
-        cv2.arrowedLine(img, (int(T.x), int(T.y)), (int(H.x), int(H.y)),
-                        (255, 0, 0), 3, cv2.LINE_AA, tipLength=0.45)
+        v = _line_dir(r["point"], pipes, cfg.arrow_reverse)
+        tip, b1, b2 = _chevron_strokes(r["point"], v, cfg.pdf_arrow_head)
+        T = fitz.Point(*tip) * M * z
+        B1 = fitz.Point(*b1) * M * z
+        B2 = fitz.Point(*b2) * M * z
+        cv2.line(img, (int(B1.x), int(B1.y)), (int(T.x), int(T.y)), (255, 0, 0), 3, cv2.LINE_AA)
+        cv2.line(img, (int(T.x), int(T.y)), (int(B2.x), int(B2.y)), (255, 0, 0), 3, cv2.LINE_AA)
     return img
 
 
