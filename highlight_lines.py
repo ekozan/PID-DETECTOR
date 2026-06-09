@@ -70,8 +70,11 @@ class HighlightConfig:
     # (produit et/ou classe à proximité). `mark_context` règle l'exigence :
     #   "both" = produit ET classe, "any" = produit OU classe, "none" = aucun.
     mark_number_re: str = r"(?<!\d)\d{5}(?!\d)"  # 5 chiffres isolés (ni 4, ni 6)
-    mark_class_re: str = r"C\d{3}"               # classe ISA (ex. C103, C203)
+    mark_class_re: str = r"[A-Z]{1,2}\d{2,3}[A-Z]?"  # classe ISA (ex. C103, C203)
+    # Produit ISA : liste explicite + motif générique (codes courts type V6, N2,
+    # ERR…) pour rattraper les produits hors liste sans configuration.
     mark_prod: Tuple[str, ...] = ("V6", "C6", "ERR", "ERA", "N2")
+    mark_prod_re: str = r"[A-Z]{1,3}\d?"
     mark_exclude_prefix: Tuple[str, ...] = ("71",)  # 71xxx = équipement/instrument
     mark_context: str = "any"      # "both" | "any" | "none"
     mark_prod_dist: float = 42.0   # distance num<->produit (pt)
@@ -265,8 +268,18 @@ def extract_line_markings(page, cfg: HighlightConfig) -> List[Tuple[str, Tuple[f
     words = _page_words(page)
     num_re = re.compile(cfg.mark_number_re)
     cls_re = re.compile(cfg.mark_class_re)
-    prod = [(x, y) for t, x, y in words if t in cfg.mark_prod]
-    cls = [(x, y) for t, x, y in words if cls_re.fullmatch(t)]
+    prod_re = re.compile(cfg.mark_prod_re) if cfg.mark_prod_re else None
+
+    def is_prod(t: str) -> bool:
+        return t in cfg.mark_prod or (prod_re is not None and prod_re.fullmatch(t) is not None)
+
+    def is_class(t: str) -> bool:
+        return cls_re.fullmatch(t) is not None
+
+    prod = [(x, y) for t, x, y in words if is_prod(t)]
+    # un même jeton peut matcher produit ET classe ; la classe (lettre+chiffres)
+    # est l'ancre la plus fiable, on l'évalue indépendamment
+    cls = [(x, y) for t, x, y in words if is_class(t)]
     out = []
     for t, x, y in words:
         m = num_re.search(t)

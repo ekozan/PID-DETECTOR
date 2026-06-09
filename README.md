@@ -131,12 +131,15 @@ Dans l'interface graphique, le sélecteur **Contexte numéro** et la case
 
 ## Marquages ISA reconnus
 
-Numéro de ligne = nombre (défaut : 5 chiffres isolés) d'un marquage
-`DN PRODUIT NUMÉRO CLASSE …`, validé par son **contexte** : un produit (`V6`,
-`C6`, `N2`…) et/ou une classe (`Cxxx`) à proximité. Le jeton est extrait par
-recherche, donc un numéro **collé** (ex. `32309C103`) est rattrapé. Tout est
-réglable via `HighlightConfig` (`mark_number_re`, `mark_class_re`, `mark_prod`,
-`mark_context`, distances `mark_prod_dist` / `mark_cls_dist`).
+Format attendu : **`DN PRODUIT NUMÉRO(5 chiffres) CLASSE`** (ex. `40 V6 32309 C103`).
+Le **numéro** (défaut : 5 chiffres isolés) est validé par son **contexte** : un
+produit et/ou une classe à proximité. Le produit est reconnu par liste
+(`mark_prod`) **ou** par motif générique (`mark_prod_re`, codes ISA courts type
+`V6`, `N2`, `ERR`…), donc un produit hors liste reste rattrapé ; la **classe**
+(`mark_class_re`) sert d'ancre fiable. Le jeton est extrait par recherche, donc
+un numéro **collé** (ex. `32309C103`) est aussi rattrapé. Tout est réglable via
+`HighlightConfig` (`mark_number_re`, `mark_class_re`, `mark_prod`,
+`mark_prod_re`, `mark_context`, distances `mark_prod_dist` / `mark_cls_dist`).
 
 ## Limites & réglages
 
