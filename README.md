@@ -80,9 +80,39 @@ il suffit d'ajuster la colonne `couleur` (hex `#RRGGBB`) puis de relancer.
 | `--outdir`       | Dossier de sortie (`out` par défaut)                                |
 | `--excel`        | Excel `ligne/couleur` **optionnel** (surcharge la palette auto)      |
 | `--pipe-layers`  | Calques de tuyauterie à colorier (défaut `UTI` ; ex. `UTI,0`)       |
+| `--mark-context` | Indices requis autour d'un numéro : `both` / `any` (défaut) / `none` |
+| `--number-re`    | Regex du numéro de ligne (défaut : 5 chiffres isolés)               |
+| `--seed-dist`    | Distance max marquage↔tuyau pour amorcer une ligne (pt)            |
+| `--diagnose`     | Journalise le texte numérique proche des tuyaux (aide au réglage)   |
 
 Tous les seuils (fusion, jonctions, distances marquage↔tuyau, rendu PDF) sont
 centralisés dans la dataclass `HighlightConfig` en haut de `highlight_lines.py`.
+
+### Lignes non détectées (numéros manquants)
+
+Une ligne n'est coloriée que si son **numéro** est reconnu près d'un tuyau. Si
+des lignes restent grises :
+
+1. **Diagnostic** — voir le texte réellement présent près des tuyaux :
+   ```bash
+   python highlight_lines.py --pdf plan.pdf --diagnose
+   ```
+   La liste montre chaque jeton numérique, sa distance au tuyau, et s'il a été
+   retenu (`✓`). On y lit le **format réel** des numéros.
+2. **Contexte trop strict** — par défaut un numéro est validé s'il a un produit
+   **ou** une classe à proximité (`any`). Pour n'exiger aucun contexte :
+   ```bash
+   python highlight_lines.py --pdf plan.pdf --mark-context none
+   ```
+3. **Format différent** — si les numéros ne sont pas des nombres à 5 chiffres,
+   ajuster la regex, ex. 6 chiffres :
+   ```bash
+   python highlight_lines.py --pdf plan.pdf --number-re "(?<!\d)\d{6}(?!\d)"
+   ```
+4. **Marquage trop loin du tuyau** — augmenter `--seed-dist` (défaut 30 pt).
+
+Dans l'interface graphique, le sélecteur **Contexte numéro** et la case
+**Diagnostic** font la même chose (le journal affiche le diagnostic).
 
 ## Couleurs
 
@@ -101,9 +131,12 @@ centralisés dans la dataclass `HighlightConfig` en haut de `highlight_lines.py`
 
 ## Marquages ISA reconnus
 
-Numéro de ligne = nombre à 5 chiffres d'un marquage `DN PRODUIT NUMÉRO CLASSE …`,
-entouré d'un produit (`V6`, `C6`, `N2`…) et d'une classe (`C10x`). Réglable via
-`HighlightConfig` (`mark_prod`, distances `mark_prod_dist` / `mark_cls_dist`).
+Numéro de ligne = nombre (défaut : 5 chiffres isolés) d'un marquage
+`DN PRODUIT NUMÉRO CLASSE …`, validé par son **contexte** : un produit (`V6`,
+`C6`, `N2`…) et/ou une classe (`Cxxx`) à proximité. Le jeton est extrait par
+recherche, donc un numéro **collé** (ex. `32309C103`) est rattrapé. Tout est
+réglable via `HighlightConfig` (`mark_number_re`, `mark_class_re`, `mark_prod`,
+`mark_context`, distances `mark_prod_dist` / `mark_cls_dist`).
 
 ## Limites & réglages
 

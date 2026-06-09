@@ -65,10 +65,19 @@ class HighlightConfig:
     cut_tol: float = 4.0           # tolérance "point bleu sur le tuyau" (pt)
     junction_tol: float = 5.0      # tolérance de jonction entre tuyaux (pt)
     blue_block: float = 5.0        # rayon de blocage autour d'un point bleu (pt)
+    # --- Marquages (numéro de ligne) ---
+    # Numéro = nombre repéré par `mark_number_re`, validé par son contexte
+    # (produit et/ou classe à proximité). `mark_context` règle l'exigence :
+    #   "both" = produit ET classe, "any" = produit OU classe, "none" = aucun.
+    mark_number_re: str = r"(?<!\d)\d{5}(?!\d)"  # 5 chiffres isolés (ni 4, ni 6)
+    mark_class_re: str = r"C\d{3}"               # classe ISA (ex. C103, C203)
     mark_prod: Tuple[str, ...] = ("V6", "C6", "ERR", "ERA", "N2")
-    mark_prod_dist: float = 32.0   # distance num<->produit (pt)
-    mark_cls_dist: float = 60.0    # distance num<->classe (pt)
-    seed_dist: float = 25.0        # distance max marquage<->tuyau pour amorcer (pt)
+    mark_exclude_prefix: Tuple[str, ...] = ("71",)  # 71xxx = équipement/instrument
+    mark_context: str = "any"      # "both" | "any" | "none"
+    mark_prod_dist: float = 42.0   # distance num<->produit (pt)
+    mark_cls_dist: float = 75.0    # distance num<->classe (pt)
+    seed_dist: float = 30.0        # distance max marquage<->tuyau pour amorcer (pt)
+    diagnose: bool = False         # journalise le texte numérique proche des tuyaux
     pdf_line_width: float = 3.5    # épaisseur trait surligné (PDF, pt)
     pdf_arrow_head: float = 5.0    # taille du chevron '>' (pt)
     pdf_arrow_width: float = 1.5   # épaisseur du chevron (pt)
@@ -237,19 +246,63 @@ def assign_lines(pipes, strong, weak, markings, cfg: HighlightConfig) -> Dict[in
 # ----------------------------------------------------------------------------
 #  Marquages (numéros de ligne)
 # ----------------------------------------------------------------------------
+def _page_words(page):
+    """Mots du PDF : (texte, cx, cy). Lus dans l'espace non roté de la page."""
+    return [(w[4], (w[0] + w[2]) / 2, (w[1] + w[3]) / 2) for w in page.get_text("words")]
+
+
 def extract_line_markings(page, cfg: HighlightConfig) -> List[Tuple[str, Tuple[float, float]]]:
-    """Numéro de ligne = nombre 5 chiffres entouré d'un produit et d'une classe."""
-    words = [(w[4], (w[0] + w[2]) / 2, (w[1] + w[3]) / 2) for w in page.get_text("words")]
+    """Numéro de ligne = nombre (``mark_number_re``) validé par son contexte.
+
+    Le numéro est extrait par **recherche** (et non égalité stricte) dans chaque
+    mot, ce qui rattrape les jetons collés (ex. ``32309C103``). La règle
+    ``mark_context`` décide des indices requis autour du numéro :
+      - ``"both"`` : un produit ET une classe proches (strict, ancien défaut) ;
+      - ``"any"``  : un produit OU une classe proche (défaut, meilleur rappel) ;
+      - ``"none"`` : aucun contexte requis (le filtrage géométrique
+        marquage↔tuyau de ``assign_lines`` fait alors le tri).
+    """
+    words = _page_words(page)
+    num_re = re.compile(cfg.mark_number_re)
+    cls_re = re.compile(cfg.mark_class_re)
     prod = [(x, y) for t, x, y in words if t in cfg.mark_prod]
-    cls = [(x, y) for t, x, y in words if re.fullmatch(r"C10\d", t)]
+    cls = [(x, y) for t, x, y in words if cls_re.fullmatch(t)]
     out = []
     for t, x, y in words:
-        if not re.fullmatch(r"\d{5}", t) or t.startswith("71"):
-            continue  # 71xxx = équipement/instrument, pas une ligne
-        if any(math.hypot(x - px, y - py) < cfg.mark_prod_dist for px, py in prod) and \
-           any(math.hypot(x - cx, y - cy) < cfg.mark_cls_dist for cx, cy in cls):
-            out.append((t, (x, y)))
+        m = num_re.search(t)
+        if not m:
+            continue
+        num = m.group()
+        if any(num.startswith(p) for p in cfg.mark_exclude_prefix):
+            continue  # ex. 71xxx = équipement/instrument, pas une ligne
+        near_prod = any(math.hypot(x - px, y - py) < cfg.mark_prod_dist for px, py in prod)
+        near_cls = any(math.hypot(x - cx, y - cy) < cfg.mark_cls_dist for cx, cy in cls)
+        if cfg.mark_context == "both":
+            ok = near_prod and near_cls
+        elif cfg.mark_context == "none":
+            ok = True
+        else:  # "any"
+            ok = near_prod or near_cls
+        if ok:
+            out.append((num, (x, y)))
     return out
+
+
+def diagnose_markings(page, pipes, cfg: HighlightConfig, near: float = 60.0) -> List[Tuple[str, float]]:
+    """Liste les jetons **contenant un chiffre** proches d'un tuyau (≤ ``near`` pt).
+
+    Sert à voir le **format réel** des numéros de ligne quand certains ne sont
+    pas reconnus (5 chiffres ? 6 ? alphanumérique ? produit/classe absents ?).
+    """
+    cand = []
+    for t, x, y in _page_words(page):
+        if not any(ch.isdigit() for ch in t):
+            continue
+        d = min((_dist_pt_pipe((x, y), p) for p in pipes), default=1e9)
+        if d <= near:
+            cand.append((t, round(d, 1)))
+    cand.sort(key=lambda c: c[1])
+    return cand
 
 
 # ----------------------------------------------------------------------------
@@ -409,12 +462,24 @@ def process(pdf, page_no, excel, outdir, cfg: HighlightConfig):
     pipes = split_pipes(pipes, blue, cfg)
     strong, weak = build_adjacency(pipes, blue, cfg)
     markings = extract_line_markings(page, cfg)
-    print(f"[2] {len(pipes)} tuyaux (calques {cfg.pipe_layers}) | {len(markings)} marquages")
+    print(f"[2] {len(pipes)} tuyaux (calques {cfg.pipe_layers}) | "
+          f"{len(markings)} marquage(s) [contexte={cfg.mark_context}]")
+
+    if cfg.diagnose:
+        cand = diagnose_markings(page, pipes, cfg)
+        found = {num for num, _ in markings}
+        print(f"    [diag] {len(cand)} jeton(s) numérique(s) près des tuyaux "
+              f"(✓ = retenu comme numéro de ligne) :")
+        for t, d in cand[:80]:
+            mark = "✓" if any(num in t for num in found) else " "
+            print(f"      {mark} {t!r:>16}  à {d}pt d'un tuyau")
 
     # 4) attribution des numéros (runs + héritage)
     label = assign_lines(pipes, strong, weak, markings, cfg)
     detected = sorted(set(label.values()))
-    print(f"[3] {len(label)}/{len(pipes)} tuyaux étiquetés | {len(detected)} lignes : {detected}")
+    unlabeled = sum(1 for i in range(len(pipes)) if i not in label)
+    print(f"[3] {len(label)}/{len(pipes)} tuyaux étiquetés "
+          f"({unlabeled} sans numéro) | {len(detected)} lignes : {detected}")
 
     # 5) couleurs : palette automatique (256), Excel optionnel en surcharge
     excel_colors = read_colors(excel) if excel and os.path.isfile(excel) else {}
@@ -448,8 +513,24 @@ def main() -> int:
     ap.add_argument("--pipe-layers", default="UTI",
                     help="calques de tuyauterie à colorier, séparés par des virgules "
                          "(défaut: UTI ; ex: UTI,0 pour plus de couverture)")
+    ap.add_argument("--mark-context", choices=["both", "any", "none"], default=None,
+                    help="indices requis autour d'un numéro : produit ET classe (both), "
+                         "OU (any, défaut), ou aucun (none, rappel maximal)")
+    ap.add_argument("--number-re", default=None,
+                    help="regex du numéro de ligne (défaut: 5 chiffres isolés)")
+    ap.add_argument("--seed-dist", type=float, default=None,
+                    help="distance max marquage↔tuyau pour amorcer une ligne (pt)")
+    ap.add_argument("--diagnose", action="store_true",
+                    help="journalise le texte numérique proche des tuyaux (aide au réglage)")
     args = ap.parse_args()
     cfg = HighlightConfig(pipe_layers=tuple(s.strip() for s in args.pipe_layers.split(",") if s.strip()))
+    if args.mark_context:
+        cfg.mark_context = args.mark_context
+    if args.number_re:
+        cfg.mark_number_re = args.number_re
+    if args.seed_dist is not None:
+        cfg.seed_dist = args.seed_dist
+    cfg.diagnose = args.diagnose
     process(args.pdf, args.page, args.excel, args.outdir, cfg)
     return 0
 
