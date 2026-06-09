@@ -79,6 +79,8 @@ class App:
         self.excel_var = tk.StringVar()
         self.layers_var = tk.StringVar(value="UTI")
         self.context_var = tk.StringVar(value="any")
+        self.break_var = tk.StringVar(value="chevron")
+        self.reverse_var = tk.BooleanVar(value=False)
         self.diagnose_var = tk.BooleanVar(value=False)
 
         ttk.Label(bar, text="Dossier P&ID :").grid(row=0, column=0, sticky="w")
@@ -96,6 +98,10 @@ class App:
         ttk.Label(opt, text="  Contexte numéro :").pack(side="left")
         ttk.Combobox(opt, textvariable=self.context_var, width=6, state="readonly",
                      values=("both", "any", "none")).pack(side="left")
+        ttk.Label(opt, text="  Rupture :").pack(side="left")
+        ttk.Combobox(opt, textvariable=self.break_var, width=8, state="readonly",
+                     values=("chevron", "tick", "dot")).pack(side="left")
+        ttk.Checkbutton(opt, text="Sens inversé", variable=self.reverse_var).pack(side="left", padx=(6, 0))
         ttk.Checkbutton(opt, text="Diagnostic", variable=self.diagnose_var).pack(side="left", padx=(8, 0))
         self.gen_btn = ttk.Button(bar, text="Générer le rendu", command=self._generate)
         self.gen_btn.grid(row=2, column=2, pady=(4, 0))
@@ -170,19 +176,24 @@ class App:
         layers = tuple(s.strip() for s in self.layers_var.get().split(",") if s.strip()) or ("UTI",)
         context = self.context_var.get()
         diagnose = bool(self.diagnose_var.get())
+        break_style = self.break_var.get()
+        reverse = bool(self.reverse_var.get())
 
         self.gen_btn.config(state="disabled")
         self.outputs.clear()
         self._log_clear()
         self.status.set(f"Génération de {len(files)} plan(s)…")
         threading.Thread(
-            target=self._work, args=(folder, files, excel, layers, context, diagnose), daemon=True
+            target=self._work,
+            args=(folder, files, excel, layers, context, diagnose, break_style, reverse),
+            daemon=True,
         ).start()
 
     # ----- traitement en arrière-plan -------------------------------------
-    def _work(self, folder, files, excel, layers, context, diagnose) -> None:
+    def _work(self, folder, files, excel, layers, context, diagnose, break_style, reverse) -> None:
         """Thread worker : traite chaque PDF, poste les résultats dans la queue."""
-        cfg = HighlightConfig(pipe_layers=layers, mark_context=context, diagnose=diagnose)
+        cfg = HighlightConfig(pipe_layers=layers, mark_context=context, diagnose=diagnose,
+                              break_style=break_style, arrow_reverse=reverse)
         for name in files:
             pdf = os.path.join(folder, name)
             stem = os.path.splitext(name)[0]

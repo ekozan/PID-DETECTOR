@@ -82,8 +82,9 @@ class HighlightConfig:
     seed_dist: float = 30.0        # distance max marquage<->tuyau pour amorcer (pt)
     diagnose: bool = False         # journalise le texte numérique proche des tuyaux
     pdf_line_width: float = 3.5    # épaisseur trait surligné (PDF, pt)
-    pdf_arrow_head: float = 5.0    # taille du chevron '>' (pt)
-    pdf_arrow_width: float = 1.5   # épaisseur du chevron (pt)
+    break_style: str = "chevron"   # "chevron" (sens) | "tick" (sans sens) | "dot"
+    pdf_arrow_head: float = 5.0    # taille du marqueur de rupture (pt)
+    pdf_arrow_width: float = 1.5   # épaisseur du marqueur (pt)
     arrow_reverse: bool = False    # inverser le sens du chevron
     alpha: float = 0.6
     default_color: str = "#B0B0B0" # couleur de repli (lignes sans numéro résolu)
@@ -395,17 +396,31 @@ def _hex_to_rgb01(h: str) -> Tuple[float, float, float]:
     return (int(h[0:2], 16) / 255, int(h[2:4], 16) / 255, int(h[4:6], 16) / 255)
 
 
+def _lb_axis(r, pipes):
+    """Axe (unitaire) de la conduite à la rupture : conduite d'accroche détectée,
+    sinon orientation du tuyau colorié le plus proche."""
+    axis = r.get("axis")
+    if axis is None and pipes:
+        q = min(pipes, key=lambda p: _dist_pt_pipe(r["point"], p))
+        axis = (1.0, 0.0) if q[2] == 'h' else (0.0, 1.0)
+    return axis or (1.0, 0.0)
+
+
 def _lb_dir(r, pipes, reverse):
-    """Direction du chevron = **sens de l'apex du triangle** (r['dir']).
-    Repli sur l'orientation du tuyau si l'apex n'a pas pu être calculé."""
+    """Direction du chevron, **toujours colinéaire à la conduite**.
+
+    On part de l'axe du tuyau (jamais en biais) ; seul le *sens* vient de l'apex
+    du triangle (``r['dir']``), réduit à un signe via sa projection sur l'axe.
+    Cela corrige les chevrons obliques et rend le sens binaire (donc inversible).
+    """
+    axis = _lb_axis(r, pipes)
     v = r.get("dir")
-    if v is None:
-        # repli : le long du tuyau le plus proche
-        if pipes:
-            q = min(pipes, key=lambda p: _dist_pt_pipe(r["point"], p))
-            v = (1.0, 0.0) if q[2] == 'h' else (0.0, 1.0)
-        else:
-            v = (1.0, 0.0)
+    if v is not None:
+        dot = v[0] * axis[0] + v[1] * axis[1]
+        sign = -1.0 if dot < 0 else 1.0
+        v = (axis[0] * sign, axis[1] * sign)
+    else:
+        v = axis
     return (-v[0], -v[1]) if reverse else v
 
 
@@ -445,14 +460,26 @@ def annotate_pdf(doc, page, pipes, label, colors, lb, cfg: HighlightConfig,
         shape.finish(color=rgb, width=cfg.pdf_line_width,
                      stroke_opacity=cfg.alpha, lineCap=1)
         shape.commit()
-    # chevrons bleus '>' aux line breaks : colinéaires au tuyau, sens rupture
+    # marqueurs bleus aux ruptures de ligne, selon `break_style` :
+    #   chevron '>' (avec sens), tick '|' (perpendiculaire, sans sens), ou dot
+    h = cfg.pdf_arrow_head
     shape = page.new_shape()
     for r in lb:
-        v = _lb_dir(r, pipes, cfg.arrow_reverse)
-        tip, b1, b2 = _chevron_strokes(r["point"], v, cfg.pdf_arrow_head)
-        shape.draw_line(fitz.Point(*b1), fitz.Point(*tip))
-        shape.draw_line(fitz.Point(*tip), fitz.Point(*b2))
-    shape.finish(color=(0, 0, 1), width=cfg.pdf_arrow_width, lineCap=1)
+        pt = r["point"]
+        if cfg.break_style == "dot":
+            shape.draw_circle(fitz.Point(*pt), h * 0.6)
+        elif cfg.break_style == "tick":
+            ax, ay = _lb_axis(r, pipes)        # barre perpendiculaire à la conduite
+            a = (pt[0] - ay * h, pt[1] + ax * h)
+            b = (pt[0] + ay * h, pt[1] - ax * h)
+            shape.draw_line(fitz.Point(*a), fitz.Point(*b))
+        else:  # chevron
+            v = _lb_dir(r, pipes, cfg.arrow_reverse)
+            tip, b1, b2 = _chevron_strokes(pt, v, h)
+            shape.draw_line(fitz.Point(*b1), fitz.Point(*tip))
+            shape.draw_line(fitz.Point(*tip), fitz.Point(*b2))
+    shape.finish(color=(0, 0, 1), width=cfg.pdf_arrow_width, lineCap=1,
+                 fill=(0, 0, 1) if cfg.break_style == "dot" else None)
     shape.commit()
     doc.save(out_path, garbage=3, deflate=True)
 
@@ -473,6 +500,18 @@ def process(pdf, page_no, excel, outdir, cfg: HighlightConfig):
     # 2-3) réseau + marquages
     pipes = build_pipes(page, cfg)
     pipes = split_pipes(pipes, blue, cfg)
+
+    if cfg.diagnose and lb:
+        print(f"    [diag] ruptures (symbole → point posé | sens) [style={cfg.break_style}] :")
+        for r in lb[:60]:
+            sx, sy = r["symbol"]
+            px, py = r["point"]
+            v = _lb_dir(r, pipes, cfg.arrow_reverse)
+            d = math.hypot(px - sx, py - sy)
+            attached = "accroché" if r.get("axis") else "centre (non accroché)"
+            print(f"      symbole ({sx:.0f},{sy:.0f}) → point ({px:.0f},{py:.0f}) "
+                  f"[{attached}, décalage {d:.0f}pt] sens=({v[0]:+.0f},{v[1]:+.0f})")
+
     strong, weak = build_adjacency(pipes, blue, cfg)
     markings = extract_line_markings(page, cfg)
     print(f"[2] {len(pipes)} tuyaux (calques {cfg.pipe_layers}) | "
@@ -533,8 +572,13 @@ def main() -> int:
                     help="regex du numéro de ligne (défaut: 5 chiffres isolés)")
     ap.add_argument("--seed-dist", type=float, default=None,
                     help="distance max marquage↔tuyau pour amorcer une ligne (pt)")
+    ap.add_argument("--break-style", choices=["chevron", "tick", "dot"], default=None,
+                    help="marqueur de rupture : chevron (avec sens), tick "
+                         "(perpendiculaire, sans sens) ou dot (point)")
+    ap.add_argument("--reverse-arrows", action="store_true",
+                    help="inverse le sens des chevrons de rupture")
     ap.add_argument("--diagnose", action="store_true",
-                    help="journalise le texte numérique proche des tuyaux (aide au réglage)")
+                    help="journalise le texte près des tuyaux + le placement des ruptures")
     args = ap.parse_args()
     cfg = HighlightConfig(pipe_layers=tuple(s.strip() for s in args.pipe_layers.split(",") if s.strip()))
     if args.mark_context:
@@ -543,6 +587,9 @@ def main() -> int:
         cfg.mark_number_re = args.number_re
     if args.seed_dist is not None:
         cfg.seed_dist = args.seed_dist
+    if args.break_style:
+        cfg.break_style = args.break_style
+    cfg.arrow_reverse = args.reverse_arrows
     cfg.diagnose = args.diagnose
     process(args.pdf, args.page, args.excel, args.outdir, cfg)
     return 0

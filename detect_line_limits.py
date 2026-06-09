@@ -49,7 +49,6 @@ class LimitConfig:
     # d'annotation/instrument qui ne sont PAS des conduites).
     pipe_layers: Tuple[str, ...] = ("UTI", "0")
     pipe_search: float = 40.0     # rayon de recherche d'une conduite proche (pt)
-    on_pipe_tol: float = 2.0      # tolérance "extrémité du symbole sur la conduite" (pt)
 
 
 def _seg_of_item(it) -> Tuple[float, float, float, float]:
@@ -148,22 +147,28 @@ def detect_line_limits(page, cfg: LimitConfig = LimitConfig()) -> List[dict]:
     results = []
     for cx, cy, segs in clusters:
         near = [L for L in longs if _foot(cx, cy, L)[1] < cfg.pipe_search]
+        junction = (cx, cy)
+        axis = None
         if near:
-            # extrémité d'un trait du symbole qui touche une conduite
-            junction, best = None, 1e9
+            # Point d'accroche = projection, SUR la conduite, de l'extrémité du
+            # symbole la plus proche d'une conduite. Robuste : pas de seuil serré,
+            # et le point tombe toujours exactement sur le tuyau (via _foot).
+            best = None  # (dist_perp, point_projeté, conduite)
             for s in segs:
                 for ex, ey in ((s[0], s[1]), (s[2], s[3])):
                     for L in near:
-                        if _foot(ex, ey, L)[1] < cfg.on_pipe_tol:
-                            d = math.hypot(ex - cx, ey - cy)
-                            if d < best:
-                                best, junction = d, (ex, ey)
-            if junction is None:  # repli : projection du centre sur la conduite
-                junction = min((_foot(cx, cy, L) for L in near), key=lambda r: r[1])[0]
-        else:
-            junction = (cx, cy)
+                        foot, fd = _foot(ex, ey, L)
+                        if best is None or fd < best[0]:
+                            best = (fd, foot, L)
+            if best is not None:
+                junction = best[1]
+                L = best[2]
+                ax, ay = L[2] - L[0], L[3] - L[1]
+                norm = math.hypot(ax, ay) or 1.0
+                axis = (ax / norm, ay / norm)  # direction de la conduite d'accroche
         direction = _apex_dir(cx, cy, small)   # sens du triangle ▽
-        results.append({"symbol": (cx, cy), "point": junction, "dir": direction})
+        results.append({"symbol": (cx, cy), "point": junction,
+                        "dir": direction, "axis": axis})
 
     # dédoublonnage : symboles distincts projetés sur le même point
     dedup = []

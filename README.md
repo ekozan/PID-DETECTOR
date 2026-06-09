@@ -83,7 +83,9 @@ il suffit d'ajuster la colonne `couleur` (hex `#RRGGBB`) puis de relancer.
 | `--mark-context` | Indices requis autour d'un numéro : `both` / `any` (défaut) / `none` |
 | `--number-re`    | Regex du numéro de ligne (défaut : 5 chiffres isolés)               |
 | `--seed-dist`    | Distance max marquage↔tuyau pour amorcer une ligne (pt)            |
-| `--diagnose`     | Journalise le texte numérique proche des tuyaux (aide au réglage)   |
+| `--break-style`  | Marqueur de rupture : `chevron` (sens), `tick` (sans sens), `dot`   |
+| `--reverse-arrows` | Inverse le sens des chevrons de rupture                           |
+| `--diagnose`     | Journalise le texte près des tuyaux **et** le placement des ruptures |
 
 Tous les seuils (fusion, jonctions, distances marquage↔tuyau, rendu PDF) sont
 centralisés dans la dataclass `HighlightConfig` en haut de `highlight_lines.py`.
@@ -127,7 +129,26 @@ Dans l'interface graphique, le sélecteur **Contexte numéro** et la case
 
 - `out/highlight.pdf` — **PDF vectoriel** annoté : chaque ligne surlignée de sa
   couleur (trait épais translucide, le tuyau d'origine reste lisible) et un
-  **chevron `>`** à chaque rupture de ligne, orienté selon le sens du symbole.
+  **marqueur** à chaque rupture de ligne.
+
+### Ruptures de ligne : localisation & sens
+
+Le point de rupture est **projeté sur la conduite** : on prend l'extrémité du
+symbole la plus proche d'un tuyau et on la projette dessus (le point tombe donc
+toujours exactement sur la conduite, sans dépendre d'un seuil serré). Le marqueur
+est **toujours colinéaire au tuyau** (jamais en biais) ; seul le *sens* vient de
+l'apex du triangle.
+
+Si le sens est inversé sur certains plans :
+
+```bash
+python highlight_lines.py --pdf plan.pdf --reverse-arrows   # inverse les chevrons
+python highlight_lines.py --pdf plan.pdf --break-style tick  # marqueur sans sens
+```
+
+`--break-style tick` (ou `dot`) supprime toute notion de direction si seule la
+**position** importe. `--diagnose` affiche, pour chaque rupture, le centre du
+symbole, le point posé, le décalage et le sens retenu.
 
 ## Marquages ISA reconnus
 
