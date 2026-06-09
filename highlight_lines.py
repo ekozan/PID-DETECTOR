@@ -432,6 +432,7 @@ def process(pdf, page_no, excel, outdir, cfg: HighlightConfig):
     out_pdf = os.path.join(outdir, "highlight.pdf")
     annotate_pdf(doc, page, pipes, label, colors, lb, cfg, out_pdf)
     print(f"[5] PDF annoté : {out_pdf}")
+    return out_pdf
 
 
 def main() -> int:

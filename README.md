@@ -36,7 +36,24 @@ aucune heuristique géométrique ne les sépare de façon fiable. On les détect
 pip install -r requirements.txt   # pymupdf + openpyxl
 ```
 
-## Utilisation
+## Interface graphique
+
+Pour traiter un **dossier de P&ID** sans passer par la ligne de commande :
+
+```bash
+python gui.py            # ou : python gui.py /chemin/vers/le/dossier
+```
+
+1. **Sélectionner un dossier** contenant des plans PDF.
+2. **Générer le rendu** : chaque plan est surligné et écrit en
+   `<dossier>/out/<nom_du_plan>/highlight.pdf` (sortie **vectorielle**).
+3. **Aperçu** : cliquer un plan dans la liste affiche son rendu à l'écran.
+
+L'Excel de couleurs (`option`) et les calques de tuyaux restent réglables depuis
+la fenêtre. L'aperçu est une simple rasterisation du PDF produit ; le fichier de
+sortie, lui, reste vectoriel. Dépend de Tkinter (paquet système `python3-tk`).
+
+## Utilisation (ligne de commande)
 
 **Une seule commande.** Couleurs automatiques, aucun Excel requis :
 
