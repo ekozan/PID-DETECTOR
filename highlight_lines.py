@@ -4,46 +4,47 @@
 highlight_lines.py
 ==================
 
-Surlignage des **lignes de tuyauterie** d'un P&ID vectoriel (PDF), une couleur
-par **numéro de ligne**, avec segmentation aux **« Limite de ligne »** (les
-points bleus : chaque point bleu = changement de numéro de ligne).
+**Commande unique** de surlignage des **lignes de tuyauterie** d'un P&ID
+vectoriel (PDF), une couleur par **numéro de ligne**, avec segmentation aux
+**« Limite de ligne »** (chaque marqueur = changement de numéro de ligne).
+
+Tout est **vectoriel** : les ruptures de ligne et les marquages sont lus
+directement dans les données du PDF, et la sortie est un **PDF annoté**.
 
 Pipeline
 --------
-1. Points bleus = « Limite de ligne » (via ``detect_line_limits``).
+1. Ruptures de ligne = « Limite de ligne » (via ``detect_line_limits``, par calque).
 2. Réseau de tuyaux : segments axis-aligned fusionnés (collinéaires + ponts de
-   trous), **coupés** à chaque point bleu, puis reliés aux jonctions (T).
+   trous), **coupés** à chaque rupture, puis reliés aux jonctions (T).
 3. Marquages : numéro de ligne = nombre à 5 chiffres d'un marquage
    ``DN PRODUIT NUMÉRO CLASSE …`` (ex. ``40 V6 32309 C103 CC N`` → ``32309``).
 4. Chaque tronçon prend le numéro du marquage le plus proche (flood-fill sur le
-   réseau, **bloqué aux points bleus**).
-5. Couleurs depuis un **fichier Excel** ``ligne / couleur`` (couleur en hex
-   ``#RRGGBB``). Un template pré-rempli avec les numéros détectés est généré
-   si besoin (``--make-template``).
-6. Rendu : plan annoté avec les lignes surlignées + points bleus.
+   réseau, **bloqué aux ruptures**).
+5. Couleurs : **automatiques** par défaut (palette de 256 couleurs distinctes).
+   Un **fichier Excel** ``ligne / couleur`` (hex ``#RRGGBB``) est *optionnel* et
+   ne sert qu'à surcharger certaines couleurs.
+6. Rendu : **PDF vectoriel** annoté (lignes surlignées + chevrons de rupture).
 
 Usage
 -----
-    # 1) générer le template Excel pré-rempli avec les numéros détectés
-    python highlight_lines.py --pdf plan.pdf --make-template --excel couleurs.xlsx
+    # couleurs automatiques (aucun Excel requis) — une seule commande
+    python highlight_lines.py --pdf plan.pdf --outdir out
 
-    # 2) après avoir mis les couleurs hex dans l'Excel, surligner
+    # optionnel : surcharger des couleurs via un Excel ligne/couleur
     python highlight_lines.py --pdf plan.pdf --excel couleurs.xlsx --outdir out
 
-Dépendances : pymupdf, opencv-python, numpy, openpyxl.
+Dépendances : pymupdf, openpyxl.
 """
 from __future__ import annotations
 
 import argparse
+import colorsys
 import math
 import os
 import re
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
-
-import cv2
-import numpy as np
+from typing import Dict, List, Tuple
 
 try:
     import fitz
@@ -68,16 +69,12 @@ class HighlightConfig:
     mark_prod_dist: float = 32.0   # distance num<->produit (pt)
     mark_cls_dist: float = 60.0    # distance num<->classe (pt)
     seed_dist: float = 25.0        # distance max marquage<->tuyau pour amorcer (pt)
-    render_zoom: float = 3.0
-    line_thickness: int = 8        # épaisseur trait (rendu PNG, px)
     pdf_line_width: float = 3.5    # épaisseur trait surligné (PDF, pt)
-    pdf_dot_radius: float = 3.0    # rayon point bleu (PDF, pt)
     pdf_arrow_head: float = 5.0    # taille du chevron '>' (pt)
     pdf_arrow_width: float = 1.5   # épaisseur du chevron (pt)
     arrow_reverse: bool = False    # inverser le sens du chevron
     alpha: float = 0.6
-    default_color: str = "#B0B0B0" # couleur des lignes sans couleur Excel
-    dot_radius: int = 8
+    default_color: str = "#B0B0B0" # couleur de repli (lignes sans numéro résolu)
 
 
 # ----------------------------------------------------------------------------
@@ -256,16 +253,53 @@ def extract_line_markings(page, cfg: HighlightConfig) -> List[Tuple[str, Tuple[f
 
 
 # ----------------------------------------------------------------------------
-#  Excel : template + lecture des couleurs
+#  Couleurs : palette automatique (256) + surcharge Excel optionnelle
 # ----------------------------------------------------------------------------
-def write_template(path: str, line_numbers: List[str]) -> None:
+def auto_palette(n: int = 256) -> List[str]:
+    """Génère ``n`` couleurs hex ``#RRGGBB`` distinctes et déterministes.
+
+    Les teintes sont réparties par le **nombre d'or** (espacement maximal) ;
+    saturation et valeur alternent par cycle pour rester séparables même avec
+    de nombreuses lignes. 256 couleurs couvrent largement un P&ID typique.
+    """
+    golden = 0.6180339887498949
+    sats = (0.85, 0.65, 1.00, 0.75)
+    vals = (0.95, 0.80, 0.70, 1.00)
+    out: List[str] = []
+    h = 0.13
+    for i in range(n):
+        h = (h + golden) % 1.0
+        s = sats[i % len(sats)]
+        v = vals[(i // len(sats)) % len(vals)]
+        r, g, b = colorsys.hsv_to_rgb(h, s, v)
+        out.append(f"#{int(r * 255):02X}{int(g * 255):02X}{int(b * 255):02X}")
+    return out
+
+
+def resolve_colors(detected: List[str], excel_colors: Dict[str, str]) -> Dict[str, str]:
+    """Couleur par numéro de ligne : palette auto par défaut, Excel prioritaire.
+
+    L'Excel est **optionnel** : toute ligne sans couleur fournie reçoit une
+    couleur de la palette automatique (256 couleurs).
+    """
+    palette = auto_palette(256)
+    colors: Dict[str, str] = {}
+    for idx, num in enumerate(sorted(set(detected))):
+        override = excel_colors.get(num, "")
+        colors[num] = override or palette[idx % len(palette)]
+    return colors
+
+
+def write_template(path: str, colors: Dict[str, str]) -> None:
+    """Écrit un Excel ``ligne / couleur`` pré-rempli avec les couleurs résolues,
+    que l'utilisateur peut éditer pour surcharger la palette automatique."""
     import openpyxl
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "lignes"
     ws.append(["ligne", "couleur"])
-    for n in sorted(set(line_numbers)):
-        ws.append([n, ""])  # couleur hex à remplir, ex. #FF0000
+    for n in sorted(colors):
+        ws.append([n, colors[n]])  # hex #RRGGBB, éditable
     wb.save(path)
 
 
@@ -283,14 +317,6 @@ def read_colors(path: str) -> Dict[str, str]:
         if color:
             colors[line] = color
     return colors
-
-
-def _hex_to_bgr(h: str) -> Tuple[int, int, int]:
-    h = h.lstrip("#")
-    if len(h) != 6:
-        return (176, 176, 176)
-    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-    return (b, g, r)
 
 
 # ----------------------------------------------------------------------------
@@ -365,43 +391,14 @@ def annotate_pdf(doc, page, pipes, label, colors, lb, cfg: HighlightConfig,
     doc.save(out_path, garbage=3, deflate=True)
 
 
-def render_highlight(page, pipes, label, colors, lb, cfg: HighlightConfig) -> np.ndarray:
-    M = page.rotation_matrix
-    z = cfg.render_zoom
-    pix = page.get_pixmap(matrix=fitz.Matrix(z, z))
-    img = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)
-    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR).copy()
-    ov = img.copy()
-    default = _hex_to_bgr(cfg.default_color)
-    for i, p in enumerate(pipes):
-        if i not in label:
-            continue
-        bgr = _hex_to_bgr(colors[label[i]]) if label[i] in colors else default
-        P1 = fitz.Point(*p[0]) * M * z
-        P2 = fitz.Point(*p[1]) * M * z
-        cv2.line(ov, (int(P1.x), int(P1.y)), (int(P2.x), int(P2.y)),
-                 bgr, cfg.line_thickness, cv2.LINE_AA)
-    img = cv2.addWeighted(ov, cfg.alpha, img, 1 - cfg.alpha, 0)
-    # chevrons bleus '>' colinéaires au tuyau
-    for r in lb:
-        v = _lb_dir(r, pipes, cfg.arrow_reverse)
-        tip, b1, b2 = _chevron_strokes(r["point"], v, cfg.pdf_arrow_head)
-        T = fitz.Point(*tip) * M * z
-        B1 = fitz.Point(*b1) * M * z
-        B2 = fitz.Point(*b2) * M * z
-        cv2.line(img, (int(B1.x), int(B1.y)), (int(T.x), int(T.y)), (255, 0, 0), 3, cv2.LINE_AA)
-        cv2.line(img, (int(T.x), int(T.y)), (int(B2.x), int(B2.y)), (255, 0, 0), 3, cv2.LINE_AA)
-    return img
-
-
 # ----------------------------------------------------------------------------
-def process(pdf, page_no, excel, outdir, make_template, also_png, cfg: HighlightConfig):
+def process(pdf, page_no, excel, outdir, cfg: HighlightConfig):
     os.makedirs(outdir, exist_ok=True)
     doc = fitz.open(pdf)
     page = doc[page_no]
     orig_rot = page.rotation  # conserver l'orientation d'affichage d'origine
 
-    # 1) line breaks (symbole + point sur la conduite)
+    # 1) ruptures de ligne (symbole + point sur la conduite)
     lb = detect_line_limits(page, LimitConfig())
     blue = [r["point"] for r in lb]
     page.set_rotation(0)
@@ -419,15 +416,16 @@ def process(pdf, page_no, excel, outdir, make_template, also_png, cfg: Highlight
     detected = sorted(set(label.values()))
     print(f"[3] {len(label)}/{len(pipes)} tuyaux étiquetés | {len(detected)} lignes : {detected}")
 
-    # 5) Excel
-    if make_template or not os.path.isfile(excel):
-        write_template(excel, detected)
-        print(f"[4] Template Excel généré : {excel} "
-              f"(remplis la colonne 'couleur' en hex #RRGGBB)")
-        if make_template:
-            return
-    colors = read_colors(excel)
-    print(f"[4] {len(colors)} couleur(s) lue(s) depuis {excel}")
+    # 5) couleurs : palette automatique (256), Excel optionnel en surcharge
+    excel_colors = read_colors(excel) if excel and os.path.isfile(excel) else {}
+    colors = resolve_colors(detected, excel_colors)
+    if excel_colors:
+        print(f"[4] {len(colors)} couleur(s) (dont {len(excel_colors)} surchargée(s) via {excel})")
+    else:
+        print(f"[4] {len(colors)} couleur(s) générée(s) automatiquement (palette 256)")
+        if excel:  # template éditable pré-rempli pour personnaliser ensuite
+            write_template(excel, colors)
+            print(f"    template éditable écrit : {excel}")
 
     # 6) sortie PDF annoté (vectoriel) — on restaure l'orientation d'affichage
     page.set_rotation(orig_rot)
@@ -435,30 +433,23 @@ def process(pdf, page_no, excel, outdir, make_template, also_png, cfg: Highlight
     annotate_pdf(doc, page, pipes, label, colors, lb, cfg, out_pdf)
     print(f"[5] PDF annoté : {out_pdf}")
 
-    if also_png:
-        img = render_highlight(page, pipes, label, colors, lb, cfg)
-        out_img = os.path.join(outdir, "highlight.png")
-        cv2.imwrite(out_img, img)
-        print(f"    PNG : {out_img}")
-
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Surlignage des lignes P&ID par couleur (Excel).")
+    ap = argparse.ArgumentParser(
+        description="Surlignage vectoriel des lignes P&ID (couleurs auto, Excel optionnel)."
+    )
     ap.add_argument("--pdf", required=True)
     ap.add_argument("--page", type=int, default=0)
-    ap.add_argument("--excel", default="couleurs_lignes.xlsx",
-                    help="Excel ligne/couleur (généré si absent)")
-    ap.add_argument("--make-template", action="store_true",
-                    help="Génère le template Excel pré-rempli et sort")
+    ap.add_argument("--excel", default=None,
+                    help="Excel ligne/couleur (OPTIONNEL) pour surcharger la palette auto ; "
+                         "si le chemin n'existe pas, un template éditable y est écrit")
     ap.add_argument("--outdir", default="out")
-    ap.add_argument("--png", action="store_true", help="produit aussi un PNG")
     ap.add_argument("--pipe-layers", default="UTI",
                     help="calques de tuyauterie à colorier, séparés par des virgules "
                          "(défaut: UTI ; ex: UTI,0 pour plus de couverture)")
     args = ap.parse_args()
     cfg = HighlightConfig(pipe_layers=tuple(s.strip() for s in args.pipe_layers.split(",") if s.strip()))
-    process(args.pdf, args.page, args.excel, args.outdir, args.make_template,
-            args.png, cfg)
+    process(args.pdf, args.page, args.excel, args.outdir, cfg)
     return 0
 
 

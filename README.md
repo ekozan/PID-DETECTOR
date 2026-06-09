@@ -1,130 +1,97 @@
 # PID-DETECTOR
 
-Détection et suivi des **lignes de tuyauterie** sur un plan **P&ID** (norme ISA) :
-détection des lignes, lecture des marquages ISA (OCR), gestion des **symboles de
-rupture** (la ligne reste logiquement continue), et colorisation cohérente.
+Surlignage des **lignes de tuyauterie** sur un plan **P&ID** (norme ISA), une
+**couleur par numéro de ligne**. Tout est **vectoriel** : les **ruptures de
+ligne** (« Limite de ligne ») et les **marquages** sont lus directement dans les
+données vectorielles du PDF, et la sortie est un **PDF annoté**.
+
+Le tout en **une seule commande**, et **sans Excel obligatoire** : les couleurs
+sont générées automatiquement (palette de **256 couleurs** distinctes). Un
+fichier Excel reste possible, uniquement pour *surcharger* certaines couleurs.
 
 ## Pipeline
 
 ```
-load_image → detect_edges → detect_lines → merge_segments
-   → detect_break_symbols → reconnect_lines → build_graph
-   → run_ocr → associate_text_to_lines → colorize_lines → export_results
+detect_line_limits (ruptures, par calque CAO)
+   → build_pipes → split_pipes (coupe aux ruptures) → build_adjacency
+   → extract_line_markings → assign_lines (runs + héritage)
+   → resolve_colors (palette 256 auto, Excel optionnel) → annotate_pdf
 ```
 
-**Idée clé.** Chaque segment fusionné est une *arête* d'un graphe `networkx` ;
-les extrémités proches sont fusionnées en *noeuds* (intersections). Une **ligne
-logique = composante connexe**. Le **symbole de rupture ISA** (triangle ouvert /
-« Y » inversé) ne coupe pas la ligne : il est détecté puis transformé en *arête
-de reconnexion* — les deux côtés gardent donc le **même ID et la même couleur**.
+**Idée clé.** Chaque **rupture de ligne** marque un changement de numéro de
+ligne : le réseau de tuyaux est coupé à ces points, segmenté en *runs*, puis
+chaque run reçoit le **numéro du marquage** le plus proche (``DN PRODUIT NUMÉRO
+CLASSE …``, ex. ``40 V6 32309 C103 CC N`` → ``32309``). Les runs sans marquage
+**héritent** du voisin à travers la rupture. Une couleur est ensuite attribuée
+par numéro de ligne.
 
-**Composants traversants.** Les vannes (noeud papillon), nuages de calorifuge et
-bulles d'instrument coupent *visuellement* la ligne sans la couper logiquement.
-Ils sont détectés (`detect_fittings`) et utilisés comme points de jonction
-supplémentaires pour la reconnexion : la conduite reste **une seule ligne** d'un
-bout à l'autre, même quand elle traverse une vanne. La reconnexion ne relie que
-des segments réellement colinéaires de part et d'autre, ce qui évite les faux
-ponts (un blob de texte isolé ne fusionne rien).
+**Détection par calque.** Les symboles « Limite de ligne », les flèches de sens,
+la pente et le calorifuge sont tous de petits triangles creux quasi identiques :
+aucune heuristique géométrique ne les sépare de façon fiable. On les détecte donc
+**par calque CAO** (non ambigu), directement dans le vectoriel.
 
 ## Installation
 
 ```bash
-pip install -r requirements.txt
-# EasyOCR est le moteur par défaut. Pour Tesseract : installer le binaire système
-# (apt install tesseract-ocr) puis: pip install pytesseract
+pip install -r requirements.txt   # pymupdf + openpyxl
 ```
 
 ## Utilisation
 
+**Une seule commande.** Couleurs automatiques, aucun Excel requis :
+
 ```bash
-# plan synthétique / propre
-python pid_detector.py --input plan.png --outdir out --debug
-
-# plan scanné réel : utiliser le preset calibré
-python pid_detector.py --input plan.jpeg --outdir out --preset real_plan --no-ocr
-
-# lister les lignes détectées (id, longueur, étendue, label) pour en choisir une
-python pid_detector.py --input plan.jpeg --preset real_plan --list-lines
-
-# surligner UNE ligne en jaune épais (par id ou par label OCR)
-python pid_detector.py --input plan.jpeg --preset real_plan --highlight 2
-python pid_detector.py --input plan.jpeg --preset real_plan --highlight-label AZOTE
+python highlight_lines.py --pdf plan.pdf --outdir out
 ```
 
-Options principales :
+Optionnel — surcharger certaines couleurs via un Excel `ligne / couleur` :
 
-| Option                | Effet                                                            |
-|-----------------------|-----------------------------------------------------------------|
-| `--input/-i`          | Image P&ID en entrée (obligatoire)                             |
-| `--outdir/-o`         | Dossier de sortie (`out` par défaut)                          |
-| `--preset`            | `default` ou `real_plan` (seuils calibrés plans scannés)      |
-| `--highlight <id>`    | Surligne la ligne d'id donné → `out/highlighted.png`         |
-| `--highlight-label X` | Surligne la ligne dont le label OCR contient `X` (ex. AZOTE)  |
-| `--list-lines`        | Liste les lignes (id, longueur, étendue, label) puis sort      |
-| `--debug`             | Sauvegarde les étapes intermédiaires dans `out/debug/`        |
-| `--no-ocr`            | Désactive l'OCR (utile sans EasyOCR/Tesseract)               |
-| `--no-fittings`       | Ne traite pas vannes/nuages comme traversants                 |
-| `--ocr-engine`        | `easyocr` (défaut) ou `tesseract`                            |
-| `--no-svg`            | Désactive l'export SVG                                         |
-| `--canny-low/-high`   | Seuils Canny                                                   |
-| `--reconnect-dist`    | Distance max de reconnexion à travers une jonction (px)       |
-| `--merge-gap`         | Trou max le long de l'axe pour fusionner deux segments (px)   |
-| `--node-snap`         | Rayon de fusion des extrémités en intersections (px)          |
-| `--reconnect-align`   | Tolérance d'alignement transversal à la reconnexion (px)      |
-| `--angle-tol`         | Tolérance d'orientation horizontale/verticale (deg)           |
-
-Tous les seuils sont centralisés et réglables dans la dataclass `Config`
-(en haut de `pid_detector.py`). Le preset **`real_plan`** applique :
-`merge_gap_tol=160`, `reconnect_max_dist=250`, `node_snap_tol=40`,
-`reconnect_align_tol=18`, `angle_tol_deg=6`, `ocr_upscale=3.0` — valeurs
-calibrées sur un plan scanné réel où la conduite principale traverse vannes,
-nuages et ruptures. L'**upscale OCR** (×3) est essentiel : sur un scan basse
-résolution, le texte des marquages est trop petit à l'échelle native ; on
-agrandit avant lecture puis on reprojette les coordonnées. Validé sur plan réel :
-le produit `AZOTE` est lu et associé à la bonne ligne, et
-`--highlight-label AZOTE` la surligne automatiquement.
-
-## Sorties
-
-- `out/annotated.png` — image avec chaque ligne d'une couleur unique, ruptures
-  marquées en rouge, étiquettes `L<id>`.
-- `out/lines.json` :
-
-```json
-{
-  "lines": [
-    {
-      "id": 2,
-      "label": "AZOTE DN50 316L",
-      "segments": [[205,150,285,150], [369,150,639,150]],
-      "breaks_detected": true
-    }
-  ]
-}
+```bash
+python highlight_lines.py --pdf plan.pdf --excel couleurs.xlsx --outdir out
 ```
 
-- `out/lines.svg` — export vectoriel des lignes (bonus).
-- `out/highlighted.png` — (si `--highlight`) une ligne surlignée en jaune épais
-  semi-transparent sur le plan d'origine, à la manière d'un repérage manuel.
+Si le chemin `--excel` n'existe pas encore, un **template éditable** pré-rempli
+avec les couleurs automatiques y est écrit (et le PDF est quand même produit) :
+il suffit d'ajuster la colonne `couleur` (hex `#RRGGBB`) puis de relancer.
+
+### Options
+
+| Option           | Effet                                                                 |
+|------------------|-----------------------------------------------------------------------|
+| `--pdf`          | P&ID vectoriel en entrée (obligatoire)                              |
+| `--page`         | Index de page (0 par défaut)                                         |
+| `--outdir`       | Dossier de sortie (`out` par défaut)                                |
+| `--excel`        | Excel `ligne/couleur` **optionnel** (surcharge la palette auto)      |
+| `--pipe-layers`  | Calques de tuyauterie à colorier (défaut `UTI` ; ex. `UTI,0`)       |
+
+Tous les seuils (fusion, jonctions, distances marquage↔tuyau, rendu PDF) sont
+centralisés dans la dataclass `HighlightConfig` en haut de `highlight_lines.py`.
+
+## Couleurs
+
+- **Automatique (défaut).** `auto_palette(256)` génère 256 couleurs hex
+  distinctes et déterministes (teintes réparties par le nombre d'or, saturation
+  et valeur alternées). Chaque numéro de ligne détecté reçoit une couleur stable.
+- **Surcharge Excel (optionnel).** Un fichier `ligne / couleur` (couleur en hex
+  `#RRGGBB`) ne sert qu'à remplacer la couleur auto pour les lignes listées ;
+  les autres restent en palette automatique.
+
+## Sortie
+
+- `out/highlight.pdf` — **PDF vectoriel** annoté : chaque ligne surlignée de sa
+  couleur (trait épais translucide, le tuyau d'origine reste lisible) et un
+  **chevron `>`** à chaque rupture de ligne, orienté selon le sens du symbole.
 
 ## Marquages ISA reconnus
 
-Format typique le long des lignes : `DN PRODUIT NUM CLASSE CALO TRACEUR`
-(ex. `50x2.4 316L DNxx AZOTE`). Le filtrage OCR par regex est configurable via
-`Config.ocr_keep_patterns` (DN…, diamètre `AxB`, matériaux `316L/304/INOX/CS`,
-produits `AZOTE/AIR/EAU/VAPEUR`…).
-
-## Bonus
-
-- **Mode surlignage** : suivi et repérage d'une ligne en jaune épais (`--highlight`).
-- Détection du **sens** via les flèches (triangles pleins).
-- Export **SVG**.
-- **Mode debug** (étapes intermédiaires + liste des lignes).
-- Composants **traversants** auto (vannes/nuages/instruments).
+Numéro de ligne = nombre à 5 chiffres d'un marquage `DN PRODUIT NUMÉRO CLASSE …`,
+entouré d'un produit (`V6`, `C6`, `N2`…) et d'une classe (`C10x`). Réglable via
+`HighlightConfig` (`mark_prod`, distances `mark_prod_dist` / `mark_cls_dist`).
 
 ## Limites & réglages
 
-- Lignes très fines → double détection de contour : ajuster `node_snap_tol` et
-  `merge_gap_tol` pour limiter la fragmentation.
-- Symboles de rupture variés selon les chartes : adapter `break_*` (aire,
-  nombre de sommets, ratio) et/ou passer en *template matching*.
+- Couverture des tuyaux : ajuster `--pipe-layers` selon les calques CAO du plan.
+- Segmentation : `merge_gap` / `merge_tol` (fusion), `junction_tol` (jonctions T),
+  `blue_block` (rayon de coupure à une rupture).
+- Détection des ruptures : calque dédié réglable dans `LimitConfig`
+  (`symbol_layer`, défaut `14`).

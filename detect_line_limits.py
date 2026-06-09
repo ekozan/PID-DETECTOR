@@ -4,9 +4,12 @@
 detect_line_limits.py
 =====================
 
-Détection du symbole **« Limite de ligne / Pipe end symbol »** sur un P&ID
-**vectoriel** (PDF), et placement d'un **point bleu** à la jonction du symbole
-sur la conduite.
+Détection **vectorielle** du symbole **« Limite de ligne / Pipe end symbol »**
+sur un P&ID PDF, et placement d'un point à la jonction du symbole sur la conduite.
+
+Module de détection importé par ``highlight_lines.py`` (la commande unique). Tout
+est lu depuis les **données vectorielles** du PDF (traits, calques) : aucun rendu
+ni traitement d'image n'est nécessaire.
 
 Méthode (robuste, par calque CAO)
 ---------------------------------
@@ -23,22 +26,13 @@ non ambigu.
      **touche une conduite** (calques ``pipe_layers``), sinon à la projection du
      centre du symbole sur la conduite la plus proche.
 
-Dépendances : pymupdf (fitz), opencv-python, numpy.
-
-Usage :
-    python detect_line_limits.py --pdf plan.pdf --outdir out [--page 0] [--symbol-layer 14]
+Dépendances : pymupdf (fitz).
 """
 from __future__ import annotations
 
-import argparse
-import json
 import math
-import os
 from dataclasses import dataclass
 from typing import List, Tuple
-
-import cv2
-import numpy as np
 
 try:
     import fitz  # PyMuPDF
@@ -56,8 +50,6 @@ class LimitConfig:
     pipe_layers: Tuple[str, ...] = ("UTI", "0")
     pipe_search: float = 40.0     # rayon de recherche d'une conduite proche (pt)
     on_pipe_tol: float = 2.0      # tolérance "extrémité du symbole sur la conduite" (pt)
-    render_zoom: float = 2.5      # zoom du rendu annoté
-    dot_radius: int = 9
 
 
 def _seg_of_item(it) -> Tuple[float, float, float, float]:
@@ -182,48 +174,3 @@ def detect_line_limits(page, cfg: LimitConfig = LimitConfig()) -> List[dict]:
 
     page.set_rotation(rot)
     return dedup
-
-
-def annotate(page, results: List[dict], cfg: LimitConfig) -> np.ndarray:
-    """Rend la page (orientation d'affichage) avec un point bleu par détection."""
-    M = page.rotation_matrix
-    z = cfg.render_zoom
-    pix = page.get_pixmap(matrix=fitz.Matrix(z, z))
-    img = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)
-    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR).copy()
-    for r in results:
-        P = fitz.Point(*r["point"]) * M * z
-        x, y = int(P.x), int(P.y)
-        cv2.circle(img, (x, y), cfg.dot_radius, (255, 0, 0), -1)
-        cv2.circle(img, (x, y), cfg.dot_radius, (0, 0, 0), 1)
-    return img
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser(description="Détection des « Limite de ligne » sur P&ID PDF.")
-    ap.add_argument("--pdf", required=True, help="P&ID vectoriel (PDF)")
-    ap.add_argument("--page", type=int, default=0)
-    ap.add_argument("--symbol-layer", default="14",
-                    help="calque CAO des symboles « Limite de ligne » (défaut: 14)")
-    ap.add_argument("--outdir", default="out")
-    args = ap.parse_args()
-
-    os.makedirs(args.outdir, exist_ok=True)
-    doc = fitz.open(args.pdf)
-    page = doc[args.page]
-    cfg = LimitConfig(symbol_layer=args.symbol_layer)
-    results = detect_line_limits(page, cfg)
-    print(f"[OK] {len(results)} « Limite de ligne » détectés (calque {cfg.symbol_layer})")
-
-    img = annotate(page, results, cfg)
-    img_path = os.path.join(args.outdir, "line_limits.png")
-    cv2.imwrite(img_path, img)
-    with open(os.path.join(args.outdir, "line_limits.json"), "w", encoding="utf-8") as f:
-        json.dump({"line_limits": [{"point": r["point"]} for r in results]}, f, indent=2)
-    print(f"     image : {img_path}")
-    print(f"     json  : {os.path.join(args.outdir, 'line_limits.json')}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
